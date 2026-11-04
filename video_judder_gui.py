@@ -16,8 +16,11 @@ Applicazione GUI (PyQt5) con supporto Drag & Drop singolo e Batch (multi-file):
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,6 +62,8 @@ from PyQt5.QtWidgets import (
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg"}
+_FFMPEG_CACHE_LOCK = threading.Lock()
+_RESOLVED_BINS: dict[str, str] = {}
 
 
 @dataclass
@@ -82,22 +87,77 @@ class BatchVideoItem:
         self.output_path = str(in_path.with_name(f"{in_path.stem}_{self.target_fps}fps{ext}"))
 
 
-def get_ffmpeg_bin(tool_name: str) -> str:
-    """Trova ffmpeg.exe / ffprobe.exe nella cartella dell'app (o bundle PyInstaller) oppure nel PATH."""
-    exe_name = f"{tool_name}.exe" if sys.platform == "win32" else tool_name
-    search_dirs = []
-    if getattr(sys, "frozen", False):
-        search_dirs.append(Path(sys.executable).parent)
-        search_dirs.append(Path(sys.executable).parent / "_internal")
-        if hasattr(sys, "_MEIPASS"):
-            search_dirs.append(Path(sys._MEIPASS))
-    search_dirs.append(Path(__file__).resolve().parent)
+def _get_persistent_bin_cache_dir() -> Path:
+    """Restituisce la cartella cache persistente per i binari FFmpeg su Windows."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else (Path.home() / "AppData" / "Local")
+    cache_dir = base / "MonoVideoFix" / "bin"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
-    for d in search_dirs:
-        candidate = d / exe_name
-        if candidate.is_file():
-            return str(candidate)
-    return tool_name
+
+def get_ffmpeg_bin(tool_name: str) -> str:
+    """
+    Trova ffmpeg.exe / ffprobe.exe con questa priorità per massimizzare la velocità di avvio:
+    1. Cartella accanto all'eseguibile / script locale.
+    2. Sistema operativo (PATH di Windows tramite shutil.which) -> nessuna estrazione se già presente!
+    3. Cartella cache persistente (%LOCALAPPDATA%\\MonoVideoFix\\bin).
+    4. Se assente ovunque, estrae on-demand dal bundle (embedded_ffmpeg.zip o _MEIPASS) nella cache persistente.
+    """
+    if tool_name in _RESOLVED_BINS:
+        return _RESOLVED_BINS[tool_name]
+
+    with _FFMPEG_CACHE_LOCK:
+        if tool_name in _RESOLVED_BINS:
+            return _RESOLVED_BINS[tool_name]
+
+        exe_name = f"{tool_name}.exe" if sys.platform == "win32" else tool_name
+
+        # 1. Cartella locale accanto all'eseguibile o allo script
+        local_dirs = []
+        if getattr(sys, "frozen", False):
+            local_dirs.append(Path(sys.executable).parent)
+            local_dirs.append(Path(sys.executable).parent / "_internal")
+        local_dirs.append(Path(__file__).resolve().parent)
+
+        for d in local_dirs:
+            candidate = d / exe_name
+            if candidate.is_file():
+                _RESOLVED_BINS[tool_name] = str(candidate)
+                return _RESOLVED_BINS[tool_name]
+
+        # 2. Controlla se ffmpeg/ffprobe è già installato nel PC (PATH di sistema)
+        sys_bin = shutil.which(exe_name) or shutil.which(tool_name)
+        if sys_bin and Path(sys_bin).is_file():
+            _RESOLVED_BINS[tool_name] = str(Path(sys_bin).resolve())
+            return _RESOLVED_BINS[tool_name]
+
+        # 3. Controlla la cache persistente su disco (%LOCALAPPDATA%\MonoVideoFix\bin)
+        cache_dir = _get_persistent_bin_cache_dir()
+        cached_exe = cache_dir / exe_name
+        if cached_exe.is_file() and cached_exe.stat().st_size > 1_000_000:
+            _RESOLVED_BINS[tool_name] = str(cached_exe)
+            return _RESOLVED_BINS[tool_name]
+
+        # 4. Estrazione on-demand direttamente dal singolo file .exe (o _MEIPASS)
+        #    Viene eseguita SOLO se ffmpeg/ffprobe non è già nel PC o nella cache!
+        if getattr(sys, "frozen", False):
+            exe_file = Path(sys.executable)
+            if exe_file.is_file() and zipfile.is_zipfile(exe_file):
+                with zipfile.ZipFile(exe_file, "r") as zf:
+                    if exe_name in zf.namelist():
+                        zf.extract(exe_name, path=cache_dir)
+                        if cached_exe.is_file():
+                            _RESOLVED_BINS[tool_name] = str(cached_exe)
+                            return _RESOLVED_BINS[tool_name]
+
+            meipass = Path(getattr(sys, "_MEIPASS", "")) if hasattr(sys, "_MEIPASS") else None
+            if meipass and (meipass / exe_name).is_file():
+                shutil.copy2(meipass / exe_name, cached_exe)
+                _RESOLVED_BINS[tool_name] = str(cached_exe)
+                return _RESOLVED_BINS[tool_name]
+
+        return tool_name
 
 
 def get_subprocess_kwargs() -> dict:
@@ -819,11 +879,11 @@ class DropAreaWidget(QWidget):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.2 (Bianco e Blu Cobalto)."""
+    """Finestra principale MONOVIDEOFIX v0.3 (Bianco e Blu Cobalto)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.2")
+        self.setWindowTitle("MONOVIDEOFIX v0.3")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -1553,10 +1613,19 @@ class VideoJudderFixerWindow(QMainWindow):
         )
 
 
+def _warmup_ffmpeg_async():
+    """Controlla/prepara ffmpeg e ffprobe in background appena aperta la finestra."""
+    try:
+        get_ffmpeg_bin("ffmpeg")
+        get_ffmpeg_bin("ffprobe")
+    except Exception:
+        pass
+
+
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.2")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.3")
         except Exception:
             pass
     app = QApplication(sys.argv)
@@ -1564,6 +1633,7 @@ def main():
     initial_files = sys.argv[1:] if len(sys.argv) > 1 else None
     win = VideoJudderFixerWindow(initial_videos=initial_files)
     win.show()
+    threading.Thread(target=_warmup_ffmpeg_async, daemon=True).start()
     sys.exit(app.exec_())
 
 

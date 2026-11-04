@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="72" height="72" alt="MonoVideoFix Logo">
 </p>
 
-<h1 align="center">MONOVIDEOFIX v0.2</h1>
+<h1 align="center">MONOVIDEOFIX v0.3</h1>
 <p align="center">
   <strong>Seedance FPS & Judder Repair Tool</strong><br>
   Strumento desktop con interfaccia grafica (PyQt5) e CLI per l'analisi automatica e la correzione chirurgica di scattini (<em>judder</em>), frame persi e frame duplicati nei video (es. conversioni errate 25 → 24 fps).
@@ -23,6 +23,8 @@
 - **Elaborazione Singola e Batch (Drag & Drop)**:
   - Trascina uno o più file video (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, `.m4v`, `.mpg`, `.mpeg`) o intere cartelle nella coda di lavoro.
   - Configura **FPS di uscita** (`24`, `25`, `30`, `60` fps) e **Codec** (`H.264`, `H.265 / HEVC 10-bit`, `Apple ProRes 422 HQ`) per singolo video o per l'intero batch.
+- **Avvio Rapido Intelligente (Smart FFmpeg Lookup & Cache)**:
+  - Il singolo file `.exe` include `ffmpeg.exe` e `ffprobe.exe` ma **non li estrae ad ogni apertura**: controlla prima se sono già presenti nel sistema (`PATH`) o nella cache locale (`%LOCALAPPDATA%\MonoVideoFix\bin`), aprendo la finestra quasi istantaneamente.
 
 ---
 
@@ -30,8 +32,8 @@
 
 Non è necessario installare Python, OpenCV o FFmpeg:
 
-1. Scarica **`MONOVIDEOFIX_v0.2.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
-2. Avvia **`MONOVIDEOFIX_v0.2.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
+1. Scarica **`MONOVIDEOFIX_v0.3.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
+2. Avvia **`MONOVIDEOFIX_v0.3.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
 3. Trascina i video nella finestra: l'analisi partirà automaticamente.
 4. Scegli gli **FPS** e il **Codec** desiderati (di default vengono impostati quelli corrispondenti al file sorgente) e clicca su **ESPORTA**.
 5. I video corretti verranno salvati nella stessa cartella degli originali con il suffisso `_[fps]fps` (es. `video_24fps.mp4` o `video_24fps.mov`).
@@ -72,12 +74,12 @@ python fix_video_judder.py input_video.mp4 --keep-frame-count --bitrate 20M
 
 ## 📦 Compilazione dell'Eseguibile Singolo (`.exe`)
 
-Per rigenerare l'eseguibile standalone a singolo file con PyInstaller (includendo automaticamente `ffmpeg.exe` e `ffprobe.exe`):
+Per rigenerare l'eseguibile standalone a singolo file con PyInstaller (includendo automaticamente `ffmpeg.exe` e `ffprobe.exe` con estrazione on-demand):
 
 ```powershell
-pyinstaller --noconfirm --clean MONOVIDEOFIX_v0.2.spec
+pyinstaller --noconfirm --clean MONOVIDEOFIX_v0.3.spec
 ```
-Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.2.exe`.
+Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.3.exe`.
 
 ---
 
@@ -87,7 +89,7 @@ Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.2.exe`.
 | :--- | :--- |
 | `video_judder_gui.py` | Applicazione desktop GUI (PyQt5) con supporto Drag & Drop e coda Batch |
 | `fix_video_judder.py` | Script CLI per analisi ottica e riparazione judder da terminale |
-| `MONOVIDEOFIX_v0.2.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg incluso |
+| `MONOVIDEOFIX_v0.3.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
 | `requirements.txt` | Elenco delle dipendenze Python del progetto |
 | `LEGGIMI.txt` | Guida rapida per l'utente finale |
 | `monovideofix.ico` / `assets/icon.svg` | Icone dell'applicazione |
