@@ -34,6 +34,7 @@ from PyQt5.QtGui import (
     QFont,
     QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
@@ -54,6 +55,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QShortcut,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -1204,10 +1206,10 @@ class MotionTimelineWidget(QWidget):
 class PreviewComparisonDialog(QDialog):
     """
     Finestra di Anteprima Confronto Prima / Dopo (Opzione 1 con strumenti diagnostici):
-    1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Passo-Passo (-1 / +1 Frame) + Salta a Anomalia.
-    2. Semaforo / Flash automatico sui Frame Duplicati o Mancanti (Bordo & Badge Live).
+    1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Navigazione frame tramite frecce Sinistra/Destra + Salta a Anomalia.
+    2. Semaforo statico a zero jitter su Bordo & Badge (dimensioni fisse, nessun ricalcolo layout).
     3. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
-    4. Modalità 'Mostra Differenza Movimento' per evidenziare visivamente i blocchi (quadro zero) e il movimento.
+    4. Modalità 'Heat-Map Movimento' ad alta chiarezza (sovrapposizione termica dei pixel in movimento sul video desaturato).
     """
 
     def __init__(self, parent: QWidget, item: BatchVideoItem):
@@ -1226,6 +1228,8 @@ class PreviewComparisonDialog(QDialog):
         self.speed_factor: float = 0.25  # Default 0.25x (Rallentatore Microscopio per rendere palese ogni scatto)
         self.diff_mode: bool = False
         self.worker: PreviewGenerationWorker | None = None
+        self._last_orig_state: str = ""
+        self._last_fixed_state: str = ""
 
         self.anomaly_frames = sorted(
             set(self.analysis.get("missing_indices", []))
@@ -1237,7 +1241,21 @@ class PreviewComparisonDialog(QDialog):
         self.timer.timeout.connect(self._advance_frame)
 
         self._build_ui()
+        self._setup_shortcuts()
         self._start_generation_for_current_segment()
+
+    def _setup_shortcuts(self):
+        self._sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
+        self._sc_left.setContext(Qt.WindowShortcut)
+        self._sc_left.activated.connect(lambda: self.step_manual(-1))
+
+        self._sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
+        self._sc_right.setContext(Qt.WindowShortcut)
+        self._sc_right.activated.connect(lambda: self.step_manual(1))
+
+        self._sc_space = QShortcut(QKeySequence(Qt.Key_Space), self)
+        self._sc_space.setContext(Qt.WindowShortcut)
+        self._sc_space.activated.connect(self.toggle_play)
 
     def _choose_start_frame(self) -> int:
         n_total = self.analysis["num_frames"]
@@ -1261,7 +1279,7 @@ class PreviewComparisonDialog(QDialog):
             }
             QFrame#VideoPanel {
                 background-color: #FFFFFF;
-                border: 4px solid #FFFFFF;
+                border: 2px solid #E2E8F0;
                 border-radius: 10px;
             }
             QPushButton#CtrlBtn {
@@ -1317,12 +1335,13 @@ class PreviewComparisonDialog(QDialog):
             )
             self.next_segment_btn.setObjectName("CtrlBtn")
             self.next_segment_btn.setCursor(Qt.PointingHandCursor)
+            self.next_segment_btn.setFocusPolicy(Qt.NoFocus)
             self.next_segment_btn.clicked.connect(self._cycle_anomaly_segment)
             top_bar.addWidget(self.next_segment_btn)
 
         root.addLayout(top_bar)
 
-        # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Semaforo Bordo & Badge
+        # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Badge compatti a larghezza/altezza fissa (zero scatti UI)
         videos_row = QHBoxLayout()
         videos_row.setSpacing(14)
 
@@ -1330,16 +1349,20 @@ class PreviewComparisonDialog(QDialog):
         self.orig_panel = QFrame()
         self.orig_panel.setObjectName("VideoPanel")
         orig_lay = QVBoxLayout(self.orig_panel)
-        orig_lay.setContentsMargins(10, 10, 10, 10)
+        orig_lay.setContentsMargins(10, 8, 10, 8)
         orig_lay.setSpacing(6)
 
         orig_top = QHBoxLayout()
+        orig_top.setContentsMargins(0, 0, 0, 0)
         orig_title = QLabel("PRIMA — VIDEO ORIGINALE")
-        orig_title.setStyleSheet("color: #000000; font-size: 12px; font-weight: 900;")
+        orig_title.setFixedHeight(22)
+        orig_title.setStyleSheet("color: #0F172A; font-size: 11px; font-weight: 900;")
         self.orig_badge = QLabel("In caricamento...")
+        self.orig_badge.setFixedSize(195, 22)
+        self.orig_badge.setAlignment(Qt.AlignCenter)
         self.orig_badge.setStyleSheet(
-            "background-color: #E2E8F0; color: #1E293B; font-size: 11px; font-weight: 900; "
-            "padding: 4px 10px; border-radius: 5px;"
+            "background-color: #F1F5F9; color: #64748B; border: 1px solid #CBD5E1; "
+            "font-size: 10px; font-weight: 700; border-radius: 4px;"
         )
         orig_top.addWidget(orig_title)
         orig_top.addStretch()
@@ -1353,23 +1376,28 @@ class PreviewComparisonDialog(QDialog):
         orig_lay.addWidget(self.orig_img_lbl, stretch=1)
 
         self.orig_meta_lbl = QLabel("Frame: —")
-        self.orig_meta_lbl.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700;")
+        self.orig_meta_lbl.setFixedHeight(18)
+        self.orig_meta_lbl.setStyleSheet("color: #475569; font-size: 11px; font-weight: 700;")
         orig_lay.addWidget(self.orig_meta_lbl)
 
         # Pannello Destro: CORRETTO
         self.fixed_panel = QFrame()
         self.fixed_panel.setObjectName("VideoPanel")
         fixed_lay = QVBoxLayout(self.fixed_panel)
-        fixed_lay.setContentsMargins(10, 10, 10, 10)
+        fixed_lay.setContentsMargins(10, 8, 10, 8)
         fixed_lay.setSpacing(6)
 
         fixed_top = QHBoxLayout()
+        fixed_top.setContentsMargins(0, 0, 0, 0)
         fixed_title = QLabel("DOPO — VIDEO CORRETTO (OPTICAL FLOW)")
-        fixed_title.setStyleSheet("color: #0047FF; font-size: 12px; font-weight: 900;")
+        fixed_title.setFixedHeight(22)
+        fixed_title.setStyleSheet("color: #0047FF; font-size: 11px; font-weight: 900;")
         self.fixed_badge = QLabel("In caricamento...")
+        self.fixed_badge.setFixedSize(195, 22)
+        self.fixed_badge.setAlignment(Qt.AlignCenter)
         self.fixed_badge.setStyleSheet(
-            "background-color: #DCFCE7; color: #15803D; font-size: 11px; font-weight: 900; "
-            "padding: 4px 10px; border-radius: 5px;"
+            "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
+            "font-size: 10px; font-weight: 700; border-radius: 4px;"
         )
         fixed_top.addWidget(fixed_title)
         fixed_top.addStretch()
@@ -1383,7 +1411,8 @@ class PreviewComparisonDialog(QDialog):
         fixed_lay.addWidget(self.fixed_img_lbl, stretch=1)
 
         self.fixed_meta_lbl = QLabel("Frame: —")
-        self.fixed_meta_lbl.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700;")
+        self.fixed_meta_lbl.setFixedHeight(18)
+        self.fixed_meta_lbl.setStyleSheet("color: #475569; font-size: 11px; font-weight: 700;")
         fixed_lay.addWidget(self.fixed_meta_lbl)
 
         videos_row.addWidget(self.orig_panel, stretch=1)
@@ -1414,7 +1443,7 @@ class PreviewComparisonDialog(QDialog):
         tl_lay.addWidget(self.timeline)
         root.addWidget(timeline_card)
 
-        # Barra Controlli: Play/Pausa, Passo-Passo (-1 / +1 Frame), Salta a Scatto, Velocità Microscopio, Differenza Movimento
+        # Barra Controlli: Play/Pausa, Salta a Scatto, Velocità Microscopio, Heat-Map Movimento
         ctrl_card = QFrame()
         ctrl_card.setObjectName("PreviewCard")
         ctrl_lay = QHBoxLayout(ctrl_card)
@@ -1424,24 +1453,14 @@ class PreviewComparisonDialog(QDialog):
         self.play_btn = QPushButton("\u23f8 Pausa")
         self.play_btn.setObjectName("PrimaryCtrlBtn")
         self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.setFocusPolicy(Qt.NoFocus)
         self.play_btn.clicked.connect(self.toggle_play)
         ctrl_lay.addWidget(self.play_btn)
-
-        self.prev_frame_btn = QPushButton("\u25c0 -1 Frame")
-        self.prev_frame_btn.setObjectName("CtrlBtn")
-        self.prev_frame_btn.setCursor(Qt.PointingHandCursor)
-        self.prev_frame_btn.clicked.connect(lambda: self.step_manual(-1))
-        ctrl_lay.addWidget(self.prev_frame_btn)
-
-        self.next_frame_btn = QPushButton("+1 Frame \u25b6")
-        self.next_frame_btn.setObjectName("CtrlBtn")
-        self.next_frame_btn.setCursor(Qt.PointingHandCursor)
-        self.next_frame_btn.clicked.connect(lambda: self.step_manual(1))
-        ctrl_lay.addWidget(self.next_frame_btn)
 
         self.jump_glitch_btn = QPushButton("\u26a0 Vai allo Scatto")
         self.jump_glitch_btn.setObjectName("CtrlBtn")
         self.jump_glitch_btn.setCursor(Qt.PointingHandCursor)
+        self.jump_glitch_btn.setFocusPolicy(Qt.NoFocus)
         self.jump_glitch_btn.setToolTip("Ferma sul fotogramma esatto del frame duplicato o mancante")
         self.jump_glitch_btn.clicked.connect(self.jump_to_next_glitch_in_clip)
         ctrl_lay.addWidget(self.jump_glitch_btn)
@@ -1461,6 +1480,7 @@ class PreviewComparisonDialog(QDialog):
             s_btn.setCheckable(True)
             s_btn.setObjectName("CtrlBtn")
             s_btn.setCursor(Qt.PointingHandCursor)
+            s_btn.setFocusPolicy(Qt.NoFocus)
             s_btn.setProperty("speed_val", spd_val)
             if idx_s == 0:
                 s_btn.setChecked(True)
@@ -1470,12 +1490,15 @@ class PreviewComparisonDialog(QDialog):
 
         ctrl_lay.addStretch()
 
-        self.diff_btn = QPushButton("\u25d0 Mostra Differenza Movimento")
+        self.diff_btn = QPushButton("\U0001f525 Heat-Map Movimento")
         self.diff_btn.setCheckable(True)
         self.diff_btn.setObjectName("CtrlBtn")
         self.diff_btn.setCursor(Qt.PointingHandCursor)
+        self.diff_btn.setFocusPolicy(Qt.NoFocus)
         self.diff_btn.setToolTip(
-            "Evidenzia la differenza rispetto al fotogramma precedente: se un frame è duplicato il quadro diventa completamente uniforme"
+            "Evidenzia con mappa termica (Blu \u2192 Ciano \u2192 Giallo \u2192 Rosso) lo spostamento reale rispetto al frame precedente:\n"
+            "• Su un frame duplicato/congelato il movimento crolla a ZERO (immagine grigia ferma + banner congelamento)\n"
+            "• Su un frame corretto i contorni in movimento restano sempre accesi e continui"
         )
         self.diff_btn.toggled.connect(self._on_diff_toggled)
         ctrl_lay.addWidget(self.diff_btn)
@@ -1488,6 +1511,8 @@ class PreviewComparisonDialog(QDialog):
             self.worker.wait()
 
         s_frame = self._choose_start_frame()
+        self._last_orig_state = ""
+        self._last_fixed_state = ""
         self.orig_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.fixed_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.play_btn.setEnabled(False)
@@ -1568,7 +1593,6 @@ class PreviewComparisonDialog(QDialog):
                 if self.timer.isActive():
                     self.timer.stop()
                     self.play_btn.setText("\u25b6 Riproduci")
-                # Sincronizza lo step con l'indice corrispondente
                 self.current_step = min(cand_orig, self.total_steps - 1)
                 self._render_current_step()
                 return
@@ -1598,22 +1622,64 @@ class PreviewComparisonDialog(QDialog):
         self._render_current_step()
 
     @staticmethod
-    def _make_diff_visual(cur_frame: np.ndarray, prev_frame: np.ndarray) -> np.ndarray:
+    def _make_diff_visual(cur_frame: np.ndarray, prev_frame: np.ndarray, status: str, delta_val: float) -> np.ndarray:
         """
-        Genera una mappa di movimento ad alta visibilit\u00e0 su sfondo chiaro:
-        - Se il frame è identico (duplicato/bloccato), il quadro resta completamente grigio chiaro uniforme (0 movimento).
-        - Dove c'è movimento reale, i contorni si accendono in Blu Cobalto MONOGRID.
+        Genera una Heat-Map diagnostica chiara e immediata sovrapposta al video:
+        - Sfondo: immagine del video desaturata e schiarita (così si riconosce sempre la scena).
+        - Zone in movimento: colorate con mappa termica (Blu -> Ciano -> Giallo -> Rosso) proporzionale allo spostamento.
+        - Se il frame è DUPLICATO / CONGELATO (movimento ~ 0), l'intera Heat-Map si spegne (grigio neutro)
+          e compare un indicatore visivo in sovrimpressione 'MOVIMENTO ZERO (FRAME RIPETUTO)'.
         """
-        diff = np.abs(cur_frame.astype(np.int16) - prev_frame.astype(np.int16))
-        mag = np.clip(np.mean(diff, axis=2) * 5.5, 0, 255).astype(np.uint8)
-        out = np.full_like(cur_frame, 244, dtype=np.uint8)
-        alpha = (mag.astype(np.float32) / 255.0)[..., None]
-        blue = np.zeros_like(cur_frame, dtype=np.float32)
-        blue[..., 0] = 0.0
-        blue[..., 1] = 71.0
-        blue[..., 2] = 255.0
-        blended = out.astype(np.float32) * (1.0 - alpha) + blue * alpha
-        return np.clip(blended, 0, 255).astype(np.uint8)
+        # Base monocromatica chiara della scena (per mantenere il riferimento visivo dei soggetti)
+        gray = cv2.cvtColor(cur_frame, cv2.COLOR_RGB2GRAY)
+        base_val = np.clip(gray.astype(np.float32) * 0.45 + 135.0, 0, 255).astype(np.uint8)
+        base_rgb = np.stack([base_val, base_val, base_val], axis=-1)
+
+        # Calcolo differenza assoluta smussata per eliminare il rumore di compressione
+        diff_u8 = cv2.absdiff(cur_frame, prev_frame)
+        diff_max = np.max(diff_u8, axis=2)
+        diff_blur = cv2.GaussianBlur(diff_max, (5, 5), 0)
+
+        # amplificazione della mappa termica (soglia antirumore a 3)
+        norm_motion = np.clip((diff_blur.astype(np.float32) - 3.0) * 7.5, 0, 255).astype(np.uint8)
+        heat_bgr = cv2.applyColorMap(norm_motion, cv2.COLORMAP_TURBO)
+        heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+        # Opacità proporzionale all'intensità del movimento (dove è fermo resta visibile la scena desaturata)
+        alpha = np.clip((diff_blur.astype(np.float32) - 3.0) / 26.0, 0.0, 0.88)[..., None]
+        out = (base_rgb.astype(np.float32) * (1.0 - alpha) + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+
+        h, w, _ = out.shape
+        # Barra di attività movimento in basso (indicatore analogico immediato)
+        bar_h = 8
+        cv2.rectangle(out, (0, h - bar_h), (w, h), (226, 232, 240), -1)
+        fill_ratio = min(1.0, delta_val / 12.0)
+        fill_w = int(round(w * fill_ratio))
+
+        if status == "duplicate" or delta_val < 0.18:
+            # Riquadro e pillola rossa di allerta quando il frame è congelato (0 movimento)
+            cv2.rectangle(out, (2, 2), (w - 3, h - 3), (220, 38, 38), 3)
+            overlay = out.copy()
+            cv2.rectangle(overlay, (12, 12), (min(w - 12, 340), 44), (220, 38, 38), -1)
+            out = cv2.addWeighted(overlay, 0.88, out, 0.12, 0)
+            cv2.putText(
+                out,
+                "0% MOVIMENTO - FRAME FERMO",
+                (22, 33),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        elif status == "missing_jump":
+            cv2.rectangle(out, (0, h - bar_h), (fill_w, h), (234, 88, 12), -1)
+        elif status in ("reconstructed_missing", "reconstructed_dup"):
+            cv2.rectangle(out, (0, h - bar_h), (fill_w, h), (22, 163, 74), -1)
+        else:
+            cv2.rectangle(out, (0, h - bar_h), (fill_w, h), (0, 71, 255), -1)
+
+        return out
 
     @staticmethod
     def _array_to_pixmap(arr: np.ndarray, target_size) -> QPixmap:
@@ -1622,6 +1688,63 @@ class PreviewComparisonDialog(QDialog):
         return QPixmap.fromImage(qimg).scaled(
             target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
+
+    def _update_panel_indicators(self, st_o: str, st_f: str):
+        """
+        Aggiorna testo e colori dei badge/bordi SOLO quando lo stato cambia e mantenendo
+        spessori di bordo (2px 패널, 1px badge) e dimensioni (195x22) rigorosamente identici
+        in ogni stato, eliminando qualsiasi micro-scatto o ricalcolo della UI.
+        """
+        if st_o != self._last_orig_state:
+            self._last_orig_state = st_o
+            if st_o == "duplicate":
+                self.orig_panel.setStyleSheet(
+                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #EF4444; border-radius: 10px; }"
+                )
+                self.orig_badge.setText("\u25cf Frame Duplicato (Blocco)")
+                self.orig_badge.setStyleSheet(
+                    "background-color: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; "
+                    "font-size: 10px; font-weight: 800; border-radius: 4px;"
+                )
+            elif st_o == "missing_jump":
+                self.orig_panel.setStyleSheet(
+                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #F59E0B; border-radius: 10px; }"
+                )
+                self.orig_badge.setText("\u25cf Salto Frame Mancante")
+                self.orig_badge.setStyleSheet(
+                    "background-color: #FFFBEB; color: #B45309; border: 1px solid #FDE68A; "
+                    "font-size: 10px; font-weight: 700; border-radius: 4px;"
+                )
+            else:
+                self.orig_panel.setStyleSheet(
+                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #E2E8F0; border-radius: 10px; }"
+                )
+                self.orig_badge.setText("Sorgente Originale")
+                self.orig_badge.setStyleSheet(
+                    "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
+                    "font-size: 10px; font-weight: 600; border-radius: 4px;"
+                )
+
+        if st_f != self._last_fixed_state:
+            self._last_fixed_state = st_f
+            if st_f in ("reconstructed_missing", "reconstructed_dup"):
+                self.fixed_panel.setStyleSheet(
+                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #3B82F6; border-radius: 10px; }"
+                )
+                self.fixed_badge.setText("\u2726 Ricostruito Optical Flow")
+                self.fixed_badge.setStyleSheet(
+                    "background-color: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; "
+                    "font-size: 10px; font-weight: 700; border-radius: 4px;"
+                )
+            else:
+                self.fixed_panel.setStyleSheet(
+                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #E2E8F0; border-radius: 10px; }"
+                )
+                self.fixed_badge.setText("Flusso Continuo")
+                self.fixed_badge.setStyleSheet(
+                    "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
+                    "font-size: 10px; font-weight: 600; border-radius: 4px;"
+                )
 
     def _render_current_step(self):
         if not self.preview_data:
@@ -1637,11 +1760,14 @@ class PreviewComparisonDialog(QDialog):
         idx_o = min(self.current_step, len(orig_frames) - 1)
         idx_f = min(self.current_step, len(fixed_frames) - 1)
 
+        st_o = orig_status[idx_o]
+        st_f = fixed_status[idx_f]
+
         if self.diff_mode:
             prev_o = orig_frames[max(0, idx_o - 1)]
             prev_f = fixed_frames[max(0, idx_f - 1)]
-            disp_o = self._make_diff_visual(orig_frames[idx_o], prev_o)
-            disp_f = self._make_diff_visual(fixed_frames[idx_f], prev_f)
+            disp_o = self._make_diff_visual(orig_frames[idx_o], prev_o, st_o, orig_deltas[idx_o])
+            disp_f = self._make_diff_visual(fixed_frames[idx_f], prev_f, st_f, fixed_deltas[idx_f])
         else:
             disp_o = orig_frames[idx_o]
             disp_f = fixed_frames[idx_f]
@@ -1649,56 +1775,7 @@ class PreviewComparisonDialog(QDialog):
         self.orig_img_lbl.setPixmap(self._array_to_pixmap(disp_o, self.orig_img_lbl.size()))
         self.fixed_img_lbl.setPixmap(self._array_to_pixmap(disp_f, self.fixed_img_lbl.size()))
 
-        # Semaforo Bordo & Badge per ORIGINALE
-        st_o = orig_status[idx_o]
-        if st_o == "duplicate":
-            self.orig_panel.setStyleSheet(
-                "QFrame#VideoPanel { background-color: #FFF1F2; border: 4px solid #DC2626; border-radius: 10px; }"
-            )
-            self.orig_badge.setText("\u26a0 FRAME DUPLICATO / CONGELATO (SCATTO)")
-            self.orig_badge.setStyleSheet(
-                "background-color: #DC2626; color: #FFFFFF; font-size: 11px; font-weight: 900; "
-                "padding: 4px 10px; border-radius: 5px;"
-            )
-        elif st_o == "missing_jump":
-            self.orig_panel.setStyleSheet(
-                "QFrame#VideoPanel { background-color: #FFF7ED; border: 4px solid #EA580C; border-radius: 10px; }"
-            )
-            self.orig_badge.setText("\u26a0 SALTO FRAME MANCANTE (SCATTO)")
-            self.orig_badge.setStyleSheet(
-                "background-color: #EA580C; color: #FFFFFF; font-size: 11px; font-weight: 900; "
-                "padding: 4px 10px; border-radius: 5px;"
-            )
-        else:
-            self.orig_panel.setStyleSheet(
-                "QFrame#VideoPanel { background-color: #FFFFFF; border: 4px solid #FFFFFF; border-radius: 10px; }"
-            )
-            self.orig_badge.setText("Frame Originale")
-            self.orig_badge.setStyleSheet(
-                "background-color: #E2E8F0; color: #1E293B; font-size: 11px; font-weight: 800; "
-                "padding: 4px 10px; border-radius: 5px;"
-            )
-
-        # Semaforo Bordo & Badge per CORRETTO
-        st_f = fixed_status[idx_f]
-        if st_f in ("reconstructed_missing", "reconstructed_dup"):
-            self.fixed_panel.setStyleSheet(
-                "QFrame#VideoPanel { background-color: #F0FDF4; border: 4px solid #16A34A; border-radius: 10px; }"
-            )
-            self.fixed_badge.setText("\u2713 FRAME RICOSTRUITO (OPTICAL FLOW 16-BIT)")
-            self.fixed_badge.setStyleSheet(
-                "background-color: #16A34A; color: #FFFFFF; font-size: 11px; font-weight: 900; "
-                "padding: 4px 10px; border-radius: 5px;"
-            )
-        else:
-            self.fixed_panel.setStyleSheet(
-                "QFrame#VideoPanel { background-color: #FFFFFF; border: 4px solid #16A34A; border-radius: 10px; }"
-            )
-            self.fixed_badge.setText("\u2713 FLUSSO CONTINUO (0 SCATTI)")
-            self.fixed_badge.setStyleSheet(
-                "background-color: #DCFCE7; color: #15803D; font-size: 11px; font-weight: 900; "
-                "padding: 4px 10px; border-radius: 5px;"
-            )
+        self._update_panel_indicators(st_o, st_f)
 
         self.orig_meta_lbl.setText(
             f"Frame sorgente #{s_frame + idx_o}  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
@@ -1708,16 +1785,6 @@ class PreviewComparisonDialog(QDialog):
         )
         self.timeline.set_step(self.current_step)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Left:
-            self.step_manual(-1)
-        elif event.key() == Qt.Key_Right:
-            self.step_manual(1)
-        elif event.key() == Qt.Key_Space:
-            self.toggle_play()
-        else:
-            super().keyPressEvent(event)
-
     def closeEvent(self, event):
         self.timer.stop()
         if self.worker and self.worker.isRunning():
@@ -1726,11 +1793,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.8 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v0.9 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.8")
+        self.setWindowTitle("MONOVIDEOFIX v0.9")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2500,7 +2567,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.8")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.9")
         except Exception:
             pass
     app = QApplication(sys.argv)
