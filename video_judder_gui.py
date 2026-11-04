@@ -879,11 +879,11 @@ class DropAreaWidget(QWidget):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.6 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v0.7 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.6")
+        self.setWindowTitle("MONOVIDEOFIX v0.7")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -892,6 +892,7 @@ class VideoJudderFixerWindow(QMainWindow):
         self.analysis_worker: BatchAnalysisWorker | None = None
         self.export_worker: BatchExportWorker | None = None
         self._updating_controls = False
+        self._user_customized_export = False
 
         self._build_ui()
         self._apply_theme()
@@ -1035,7 +1036,7 @@ class VideoJudderFixerWindow(QMainWindow):
         card_layout.addWidget(self.log_box)
         root.addWidget(analysis_card)
 
-        # 5. Card Impostazioni di Export (FPS + Codec + Applica a tutti)
+        # 5. Card Impostazioni di Export (applicate di default a tutti i video caricati)
         export_card = QFrame()
         export_card.setObjectName("Card")
         exp_layout = QVBoxLayout(export_card)
@@ -1047,13 +1048,8 @@ class VideoJudderFixerWindow(QMainWindow):
         exp_title.setStyleSheet(
             "background: transparent; font-size: 11px; font-weight: 800; color: #FFFFFF; letter-spacing: 1px;"
         )
-        self.apply_all_btn = QPushButton("Applica FPS e Codec scelti a tutta la coda")
-        self.apply_all_btn.setObjectName("SmallAccentBtn")
-        self.apply_all_btn.setCursor(Qt.PointingHandCursor)
-        self.apply_all_btn.clicked.connect(self.apply_settings_to_all)
         exp_top.addWidget(exp_title)
         exp_top.addStretch()
-        exp_top.addWidget(self.apply_all_btn)
         exp_layout.addLayout(exp_top)
 
         # Selettore FPS: 24 / 25 / 30 / 60
@@ -1232,19 +1228,6 @@ class VideoJudderFixerWindow(QMainWindow):
                 background-color: #FEE2E2;
                 color: #DC2626;
             }
-            QPushButton#SmallAccentBtn {
-                background-color: #FFFFFF;
-                border: none;
-                border-radius: 6px;
-                padding: 5px 11px;
-                color: #0047FF;
-                font-size: 11px;
-                font-weight: 800;
-            }
-            QPushButton#SmallAccentBtn:hover {
-                background-color: #E2EBFF;
-                color: #0035C9;
-            }
             QPushButton#ExportBtn {
                 background-color: #FFFFFF;
                 border: none;
@@ -1296,13 +1279,15 @@ class VideoJudderFixerWindow(QMainWindow):
 
         existing_paths = {os.path.normcase(os.path.abspath(it.path)) for it in self.batch_items}
         added_any = False
+        cur_fps = self.get_selected_fps()
+        cur_codec = self.get_selected_codec()
 
         for p in video_paths:
             norm_p = os.path.normcase(os.path.abspath(p))
             if norm_p in existing_paths:
                 continue
             existing_paths.add(norm_p)
-            item = BatchVideoItem(path=p)
+            item = BatchVideoItem(path=p, target_fps=cur_fps, target_codec=cur_codec)
             item.update_output_path()
             self.batch_items.append(item)
             self._append_table_row(item)
@@ -1402,6 +1387,7 @@ class VideoJudderFixerWindow(QMainWindow):
         if self.table.rowCount() > 0:
             self.table.selectRow(min(row, self.table.rowCount() - 1))
         else:
+            self._user_customized_export = False
             self._clear_details_panel()
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("Pronto")
@@ -1421,13 +1407,6 @@ class VideoJudderFixerWindow(QMainWindow):
             return
 
         item = self.batch_items[row]
-        self._updating_controls = True
-        if item.target_fps in self.fps_Group_buttons:
-            self.fps_Group_buttons[item.target_fps].setChecked(True)
-        if item.target_codec in self.codec_buttons:
-            self.codec_buttons[item.target_codec].setChecked(True)
-        self._updating_controls = False
-
         self.out_preview_lbl.setText(f"File di output: {item.output_path}")
 
         if item.meta and item.analysis:
@@ -1461,15 +1440,8 @@ class VideoJudderFixerWindow(QMainWindow):
     def _on_user_option_changed(self):
         if self._updating_controls:
             return
-        row = self.get_selected_row()
-        if row < 0 or row >= len(self.batch_items):
-            return
-        item = self.batch_items[row]
-        item.target_fps = self.get_selected_fps()
-        item.target_codec = self.get_selected_codec()
-        item.update_output_path()
-        self.out_preview_lbl.setText(f"File di output: {item.output_path}")
-        self._refresh_table_row(row)
+        self._user_customized_export = True
+        self.apply_settings_to_all()
 
     def apply_settings_to_all(self):
         fps_val = self.get_selected_fps()
@@ -1516,13 +1488,20 @@ class VideoJudderFixerWindow(QMainWindow):
         item = self.batch_items[idx]
         item.meta = meta
         item.analysis = analysis
-        # Default FPS e Codec corrispondenti al video in ingresso
-        item.target_fps = meta["closest_fps"]
-        item.target_codec = meta["detected_codec"]
-        item.update_output_path()
+
+        # Se è il primo video analizzato e l'utente non ha ancora cambiato manualmente
+        # le impostazioni, sincronizza i selettori globali con il formato del video e applicalo a tutta la coda
+        if idx == 0 and not self._user_customized_export:
+            self._updating_controls = True
+            if meta["closest_fps"] in self.fps_Group_buttons:
+                self.fps_Group_buttons[meta["closest_fps"]].setChecked(True)
+            if meta["detected_codec"] in self.codec_buttons:
+                self.codec_buttons[meta["detected_codec"]].setChecked(True)
+            self._updating_controls = False
+
         item.report_text = build_report_text(meta, analysis)
         item.status = "Pronto"
-        self._refresh_table_row(idx)
+        self.apply_settings_to_all()
         if self.get_selected_row() == idx:
             self._on_table_selection_changed()
 
@@ -1552,6 +1531,9 @@ class VideoJudderFixerWindow(QMainWindow):
         ready = [it for it in self.batch_items if it.meta and it.analysis]
         if not ready:
             return
+
+        # Garantisce che tutti i video in coda usino le impostazioni di export selezionate
+        self.apply_settings_to_all()
 
         self.export_btn.setEnabled(False)
         self.drop_area.setEnabled(False)
@@ -1630,7 +1612,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.6")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.7")
         except Exception:
             pass
     app = QApplication(sys.argv)
