@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="72" height="72" alt="MonoVideoFix Logo">
 </p>
 
-<h1 align="center">MONOVIDEOFIX v0.7</h1>
+<h1 align="center">MONOVIDEOFIX v0.8</h1>
 <p align="center">
   <strong>Seedance FPS & Judder Repair Tool</strong><br>
   Strumento desktop con interfaccia grafica (PyQt5) e CLI per l'analisi automatica e la correzione chirurgica di scattini (<em>judder</em>), frame persi e frame duplicati nei video (es. conversioni errate 25 → 24 fps).
@@ -16,6 +16,12 @@
   - Individua **frame mancanti** (salti di movimento anomali ~2x rispetto ai fotogrammi adiacenti) e rileva automaticamente eventuali **cadenze periodiche** (es. 1 frame perso ogni 24 fotogrammi).
   - Individua **frame duplicati / congelati** (freeze frames).
   - Riconosce ed esclude automaticamente i **cambi di inquadratura (scene cuts)** per evitare artefatti tra scene diverse.
+- **Anteprima & Verifica Diagnostica Prima / Dopo (`👁 Anteprima & Verifica Correzione`)**:
+  - **Confronto Side-by-Side sincronizzato** tra il video *Originale* e il video *Corretto (Optical Flow)*.
+  - **Rallentatore "Microscopio" (`0.25x` / `0.5x` / `1x`) + Avanzamento Passo-Passo (`◀ -1 Frame` / `+1 Frame ▶`)**: rende palese a occhio nudo ogni frame ripetuto o salto risolto.
+  - **Semaforo / Flash automatico sui Frame Anomali**: bordo e badge live rossi/arancioni sui frame duplicati o mancanti dell'originale e verdi sui frame ricostruiti del video corretto.
+  - **Timeline "Elettrocardiogramma" (Grafico del Movimento Frame-by-Frame)**: mostra le tacche rosse dei blocchi/salti sull'originale e il flusso continuo sul video corretto; cliccando su una tacca si salta all'istante esatto dello scatto.
+  - **Modalità "Mostra Differenza Movimento"**: mappa visiva ad alto contrasto che evidenzia immediatamente se due fotogrammi consecutivi sono congelati (quadro uniforme) o in movimento continuo.
 - **Ricostruzione Chirurgica a 16-bit (Zero Degrado sui Frame Originali)**:
   - **100% Bit-Exact sui frame sani**: tutti i fotogrammi originali vengono copiati intatti senza alcuna alterazione o sfocatura.
   - **Interpolazione DIS Optical Flow bidirezionale**: ricostruisce *esclusivamente* i fotogrammi mancanti o sostituisce i fotogrammi duplicati tramite flusso ottico denso bidirezionale (`cv2.DISOpticalFlow`) con pesatura di occlusione forward-backward.
@@ -32,11 +38,12 @@
 
 Non è necessario installare Python, OpenCV o FFmpeg:
 
-1. Scarica **`MONOVIDEOFIX_v0.7.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
-2. Avvia **`MONOVIDEOFIX_v0.7.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
+1. Scarica **`MONOVIDEOFIX_v0.8.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
+2. Avvia **`MONOVIDEOFIX_v0.8.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
 3. Trascina i video nella finestra: l'analisi partirà automaticamente.
-4. Scegli gli **FPS** e il **Codec** desiderati (applicati automaticamente a tutta la coda) e clicca su **ESPORTA**.
-5. I video corretti verranno salvati nella stessa cartella degli originali con il suffisso `_[fps]fps` (es. `video_24fps.mp4` o `video_24fps.mov`).
+4. Clicca su **`👁 Anteprima & Verifica Correzione`** per ispezionare al rallentatore (`0.25x`) o fotogramma per fotogramma la risoluzione dei frame mancanti/duplicati.
+5. Scegli gli **FPS** e il **Codec** desiderati (applicati automaticamente a tutta la coda) e clicca su **ESPORTA**.
+6. I video corretti verranno salvati nella stessa cartella degli originali con il suffisso `_[fps]fps` (es. `video_24fps.mp4` o `video_24fps.mov`).
 
 ---
 
@@ -77,9 +84,9 @@ python fix_video_judder.py input_video.mp4 --keep-frame-count --bitrate 20M
 Per rigenerare l'eseguibile standalone a singolo file con PyInstaller (includendo automaticamente `ffmpeg.exe` e `ffprobe.exe` con estrazione on-demand):
 
 ```powershell
-pyinstaller --noconfirm --clean MONOVIDEOFIX_v0.7.spec
+pyinstaller --noconfirm --clean MONOVIDEOFIX_v0.8.spec
 ```
-Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.7.exe`.
+Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.8.exe`.
 
 ---
 
@@ -87,9 +94,9 @@ Il file compilato verrà generato in `dist\MONOVIDEOFIX_v0.7.exe`.
 
 | File | Descrizione |
 | :--- | :--- |
-| `video_judder_gui.py` | Applicazione desktop GUI (PyQt5) con supporto Drag & Drop e coda Batch |
+| `video_judder_gui.py` | Applicazione desktop GUI (PyQt5) con supporto Drag & Drop, Preview Prima/Dopo e coda Batch |
 | `fix_video_judder.py` | Script CLI per analisi ottica e riparazione judder da terminale |
-| `MONOVIDEOFIX_v0.7.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
+| `MONOVIDEOFIX_v0.8.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
 | `requirements.txt` | Elenco delle dipendenze Python del progetto |
 | `LEGGIMI.txt` | Guida rapida per l'utente finale |
 | `monovideofix.ico` / `assets/icon.svg` | Icone dell'applicazione |

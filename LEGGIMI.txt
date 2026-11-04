@@ -1,12 +1,12 @@
 ========================================================================
-MONOVIDEOFIX v0.7 (Versione Portable)
+MONOVIDEOFIX v0.8 (Versione Portable)
 Seedance FPS & Judder Repair Tool
 ========================================================================
 
 Nessuna installazione richiesta (include già Python, OpenCV, PyQt5 e FFmpeg).
 
 COME USARE IL PROGRAMMA:
-1. Fai doppio clic su "MONOVIDEOFIX_v0.7.exe" per avviare l'applicazione.
+1. Fai doppio clic su "MONOVIDEOFIX_v0.8.exe" per avviare l'applicazione.
    - Avvio ultra-rapido: se FFmpeg/FFprobe sono già presenti nel PC (o nella
      cache locale dopo il primo avvio), salta la fase di estrazione!
 2. Trascina uno o più file video (o un'intera cartella) in qualsiasi punto
@@ -15,9 +15,12 @@ COME USARE IL PROGRAMMA:
    - Frame mancanti (es. scattini da conversione 25 -> 24 fps su video Seedance)
    - Frame duplicati / congelati
    - Cambi d'inquadratura (scene cuts)
-4. Scegli gli FPS (24/25/30/60) e il Codec (H.264 / H.265 / ProRes 422 HQ):
+4. Clicca su "👁 Anteprima & Verifica Correzione" per aprire il confronto
+   Prima / Dopo con rallentatore 0.25x, avanzamento frame-by-frame, semaforo
+   live sui frame anomali, timeline del movimento e differenza movimento.
+5. Scegli gli FPS (24/25/30/60) e il Codec (H.264 / H.265 / ProRes 422 HQ):
    le impostazioni vengono applicate automaticamente a tutti i video caricati.
    Puoi rimuovere un singolo video cliccando sulla "✕" a sinistra del nome file.
-5. Clicca su "ESPORTA": i video corretti verranno salvati nella stessa
+6. Clicca su "ESPORTA": i video corretti verranno salvati nella stessa
    cartella dei file originali con il suffisso "_xxfps" (es. video_24fps.mp4).
 ========================================================================

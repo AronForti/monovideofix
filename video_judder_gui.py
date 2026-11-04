@@ -26,7 +26,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -878,12 +879,858 @@ class DropAreaWidget(QWidget):
                 self.files_dropped.emit(files)
 
 
+class PreviewGenerationWorker(QThread):
+    """Genera i fotogrammi affiancati Prima (Originale) / Dopo (Corretto Optical Flow) per uno spezzone diagnostico."""
+
+    progress = pyqtSignal(int, str)
+    finished_preview = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, item: BatchVideoItem, start_frame: int, num_frames: int = 80):
+        super().__init__()
+        self.item = item
+        self.start_frame = start_frame
+        self.num_frames = num_frames
+
+    def run(self):
+        try:
+            meta = self.item.meta
+            analysis = self.item.analysis
+            w_src, h_src = meta["width"], meta["height"]
+            scale = min(1.0, 560.0 / max(w_src, 1), 350.0 / max(h_src, 1))
+            pw = max(64, int(round(w_src * scale / 2)) * 2)
+            ph = max(64, int(round(h_src * scale / 2)) * 2)
+
+            fps = meta["fps"] or 24.0
+            n_total = analysis["num_frames"]
+            s_frame = max(0, min(self.start_frame, max(0, n_total - 10)))
+            count = min(self.num_frames, n_total - s_frame)
+            start_sec = s_frame / fps
+
+            self.progress.emit(10, "Estrazione fotogrammi del segmento selezionato...")
+            cmd = [
+                get_ffmpeg_bin("ffmpeg"),
+                "-v", "error",
+                "-ss", f"{start_sec:.4f}",
+                "-i", meta["path"],
+                "-frames:v", str(count),
+                "-vf", f"scale={pw}:{ph}",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, **get_subprocess_kwargs())
+            frame_bytes = pw * ph * 3
+            orig_frames: list[np.ndarray] = []
+            while len(orig_frames) < count:
+                raw = proc.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    break
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape((ph, pw, 3)).copy()
+                orig_frames.append(arr)
+            if proc.stdout:
+                proc.stdout.close()
+            proc.wait()
+
+            if len(orig_frames) < 3:
+                raise RuntimeError("Impossibile decodificare abbastanza fotogrammi per la preview.")
+
+            missing_set = set(analysis["missing_indices"])
+            duplicate_set = set(analysis["duplicate_indices"])
+            ratios = analysis["ratios"]
+
+            replace_dup_set = set()
+            drop_dup_set = set()
+            for d_idx in duplicate_set:
+                if d_idx + 1 < len(ratios) and ratios[d_idx + 1] > 1.50:
+                    replace_dup_set.add(d_idx + 1)
+                else:
+                    drop_dup_set.add(d_idx + 1)
+
+            orig_status: list[str] = []
+            fixed_frames: list[np.ndarray] = []
+            fixed_status: list[str] = []
+            fixed_from_orig_idx: list[int] = []
+
+            n_seg = len(orig_frames)
+            last_written = orig_frames[0]
+            pending_replace = False
+
+            for k in range(n_seg):
+                g_idx = s_frame + k
+                cur_f = orig_frames[k]
+                next_f = orig_frames[k + 1] if (k + 1 < n_seg) else None
+
+                # Stato del fotogramma nel video Originale
+                if (g_idx - 1) in duplicate_set or g_idx in drop_dup_set or g_idx in replace_dup_set:
+                    orig_status.append("duplicate")
+                elif g_idx in missing_set:
+                    orig_status.append("missing_jump")
+                else:
+                    orig_status.append("normal")
+
+                # Ricostruzione fotogrammi nel video Corretto
+                if g_idx in drop_dup_set:
+                    pass
+                elif pending_replace and next_f is not None:
+                    self.progress.emit(
+                        20 + int(65 * k / max(n_seg, 1)),
+                        f"Ricostruzione Optical Flow frame ripetuto #{g_idx}...",
+                    )
+                    mid16 = interpolate_midpoint_16bit(
+                        last_written.astype(np.uint16) << 8,
+                        next_f.astype(np.uint16) << 8,
+                        alpha=0.5,
+                    )
+                    mid8 = (mid16 >> 8).astype(np.uint8)
+                    fixed_frames.append(mid8)
+                    fixed_status.append("reconstructed_dup")
+                    fixed_from_orig_idx.append(k)
+                    last_written = mid8
+                    pending_replace = False
+                else:
+                    fixed_frames.append(cur_f)
+                    fixed_status.append("normal")
+                    fixed_from_orig_idx.append(k)
+                    last_written = cur_f
+
+                if (g_idx + 1) in replace_dup_set:
+                    pending_replace = True
+
+                if g_idx in missing_set and next_f is not None:
+                    self.progress.emit(
+                        20 + int(65 * k / max(n_seg, 1)),
+                        f"Ricostruzione Optical Flow frame mancante #{g_idx}\u2192#{g_idx+1}...",
+                    )
+                    mid16 = interpolate_midpoint_16bit(
+                        cur_f.astype(np.uint16) << 8,
+                        next_f.astype(np.uint16) << 8,
+                        alpha=0.5,
+                    )
+                    mid8 = (mid16 >> 8).astype(np.uint8)
+                    fixed_frames.append(mid8)
+                    fixed_status.append("reconstructed_missing")
+                    fixed_from_orig_idx.append(k)
+                    last_written = mid8
+
+            self.progress.emit(90, "Calcolo curva del movimento frame-by-frame...")
+
+            def compute_deltas(frames_list: list[np.ndarray]) -> list[float]:
+                if not frames_list:
+                    return []
+                deltas = [0.0]
+                for i in range(1, len(frames_list)):
+                    d = float(
+                        np.mean(
+                            np.abs(
+                                frames_list[i].astype(np.float32)
+                                - frames_list[i - 1].astype(np.float32)
+                            )
+                        )
+                    )
+                    deltas.append(d)
+                if len(deltas) > 1:
+                    deltas[0] = deltas[1]
+                return deltas
+
+            orig_deltas = compute_deltas(orig_frames)
+            fixed_deltas = compute_deltas(fixed_frames)
+
+            # Rileva eventuali frame congelati residui (delta quasi 0 quando il movimento medio è presente)
+            med_orig_d = float(np.median(orig_deltas)) if orig_deltas else 0.0
+            for i in range(1, len(orig_frames)):
+                if med_orig_d > 0.6 and orig_deltas[i] < 0.18 and orig_status[i] == "normal":
+                    orig_status[i] = "duplicate"
+
+            self.progress.emit(100, "Anteprima pronta!")
+            self.finished_preview.emit({
+                "start_frame": s_frame,
+                "fps": fps,
+                "target_fps": self.item.target_fps,
+                "orig_frames": orig_frames,
+                "orig_deltas": orig_deltas,
+                "orig_status": orig_status,
+                "fixed_frames": fixed_frames,
+                "fixed_deltas": fixed_deltas,
+                "fixed_status": fixed_status,
+                "fixed_from_orig_idx": fixed_from_orig_idx,
+            })
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class MotionTimelineWidget(QWidget):
+    """
+    Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame):
+    Mostra i due tracciati (Originale sopra, Corretto sotto) evidenziando in ROSSO
+    i frame congelati/ripetuti o i salti di frame mancanti, e in VERDE i frame ricostruiti.
+    Cliccando sul grafico si salta istantaneamente a quel fotogramma.
+    """
+
+    frame_selected = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(118)
+        self.setCursor(Qt.PointingHandCursor)
+        self.orig_deltas: list[float] = []
+        self.orig_status: list[str] = []
+        self.fixed_deltas: list[float] = []
+        self.fixed_status: list[str] = []
+        self.current_step: int = 0
+        self.total_steps: int = 1
+
+    def set_data(
+        self,
+        orig_deltas: list[float],
+        orig_status: list[str],
+        fixed_deltas: list[float],
+        fixed_status: list[str],
+    ):
+        self.orig_deltas = orig_deltas
+        self.orig_status = orig_status
+        self.fixed_deltas = fixed_deltas
+        self.fixed_status = fixed_status
+        self.total_steps = max(len(orig_deltas), len(fixed_deltas), 1)
+        self.current_step = 0
+        self.update()
+
+    def set_step(self, step: int):
+        self.current_step = max(0, min(step, self.total_steps - 1))
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.total_steps > 1:
+            left_pad = 135.0
+            right_pad = 14.0
+            usable_w = max(10.0, self.width() - left_pad - right_pad)
+            rel_x = max(0.0, min(usable_w, event.pos().x() - left_pad))
+            step = int(round((rel_x / usable_w) * (self.total_steps - 1)))
+            self.frame_selected.emit(step)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self.total_steps > 1:
+            self.mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        rect = QRectF(self.rect())
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawRoundedRect(rect, 8.0, 8.0)
+
+        if not self.orig_deltas and not self.fixed_deltas:
+            p.setPen(QColor("#64748B"))
+            p.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            p.drawText(rect, Qt.AlignCenter, "Generazione del grafico del movimento frame-by-frame in corso...")
+            p.end()
+            return
+
+        left_pad = 135.0
+        right_pad = 14.0
+        w = rect.width()
+        h = rect.height()
+        usable_w = max(10.0, w - left_pad - right_pad)
+
+        all_vals = (self.orig_deltas or [1.0]) + (self.fixed_deltas or [1.0])
+        max_val = max(float(np.percentile(all_vals, 96)) * 1.35, 1.0)
+
+        # Divisore orizzontale tra corsia Originale (sopra) e Corretto (sotto)
+        mid_y = h * 0.50
+        p.setPen(QPen(QColor("#E2E8F0"), 1.0))
+        p.drawLine(QPointF(8, mid_y), QPointF(w - 8, mid_y))
+
+        # Etichette corsie a sinistra
+        p.setFont(QFont("Segoe UI", 8, QFont.ExtraBold))
+        p.setPen(QColor("#DC2626"))
+        p.drawText(
+            QRectF(10, 6, left_pad - 16, mid_y - 10),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "ORIGINALE\n(Rosso = Scatto/Blocco)",
+        )
+        p.setPen(QColor("#16A34A"))
+        p.drawText(
+            QRectF(10, mid_y + 4, left_pad - 16, mid_y - 10),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "CORRETTO\n(Verde = Ricostruito)",
+        )
+
+        def draw_bars(deltas: list[float], statuses: list[str], top_y: float, bottom_y: float, is_fixed: bool):
+            n = len(deltas)
+            if n == 0:
+                return
+            bar_slot = usable_w / n
+            bar_w = max(2.0, min(9.0, bar_slot * 0.76))
+            lane_h = bottom_y - top_y - 8.0
+            base_y = bottom_y - 4.0
+
+            for i, (val, st) in enumerate(zip(deltas, statuses)):
+                x = left_pad + i * bar_slot + (bar_slot - bar_w) * 0.5
+                norm_h = min(1.0, val / max_val) * lane_h
+                bar_h = max(3.0, norm_h)
+
+                if not is_fixed:
+                    if st == "duplicate":
+                        color = QColor("#DC2626")  # Rosso vivo: frame congelato (delta ~ 0)
+                        bar_h = lane_h  # Tacca rossa a tutta altezza per renderlo visibilissimo
+                    elif st == "missing_jump":
+                        color = QColor("#EA580C")  # Arancio/Rosso: salto per frame mancante
+                    else:
+                        color = QColor("#94A3B8")
+                else:
+                    if st in ("reconstructed_missing", "reconstructed_dup"):
+                        color = QColor("#16A34A")  # Verde brillante: frame ricostruito Optical Flow
+                    else:
+                        color = QColor("#0047FF")  # Blu MONOGRID: flusso continuo
+
+                p.setPen(Qt.NoPen)
+                p.setBrush(color)
+                p.drawRoundedRect(QRectF(x, base_y - bar_h, bar_w, bar_h), 1.5, 1.5)
+
+        draw_bars(self.orig_deltas, self.orig_status, 4.0, mid_y, is_fixed=False)
+        draw_bars(self.fixed_deltas, self.fixed_status, mid_y + 2.0, h - 2.0, is_fixed=True)
+
+        # Cursore del fotogramma corrente
+        if self.total_steps > 1:
+            play_x = left_pad + (self.current_step / (self.total_steps - 1)) * usable_w
+            p.setPen(QPen(QColor("#0047FF"), 2.2))
+            p.drawLine(QPointF(play_x, 2.0), QPointF(play_x, h - 2.0))
+
+        p.end()
+
+
+class PreviewComparisonDialog(QDialog):
+    """
+    Finestra di Anteprima Confronto Prima / Dopo (Opzione 1 con strumenti diagnostici):
+    1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Passo-Passo (-1 / +1 Frame) + Salta a Anomalia.
+    2. Semaforo / Flash automatico sui Frame Duplicati o Mancanti (Bordo & Badge Live).
+    3. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
+    4. Modalità 'Mostra Differenza Movimento' per evidenziare visivamente i blocchi (quadro zero) e il movimento.
+    """
+
+    def __init__(self, parent: QWidget, item: BatchVideoItem):
+        super().__init__(parent)
+        self.item = item
+        self.meta = item.meta
+        self.analysis = item.analysis
+
+        self.setWindowTitle(f"Anteprima & Verifica Correzione — {Path(item.path).name}")
+        self.setWindowIcon(create_app_icon())
+        self.setMinimumSize(1080, 740)
+
+        self.preview_data: dict | None = None
+        self.current_step: int = 0
+        self.total_steps: int = 1
+        self.speed_factor: float = 0.25  # Default 0.25x (Rallentatore Microscopio per rendere palese ogni scatto)
+        self.diff_mode: bool = False
+        self.worker: PreviewGenerationWorker | None = None
+
+        self.anomaly_frames = sorted(
+            set(self.analysis.get("missing_indices", []))
+            | set(self.analysis.get("duplicate_indices", []))
+        )
+        self.current_anomaly_pos = 0
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._advance_frame)
+
+        self._build_ui()
+        self._start_generation_for_current_segment()
+
+    def _choose_start_frame(self) -> int:
+        n_total = self.analysis["num_frames"]
+        if self.anomaly_frames:
+            target = self.anomaly_frames[self.current_anomaly_pos % len(self.anomaly_frames)]
+            return max(0, min(target - 12, max(0, n_total - 72)))
+        return max(0, min(int(n_total * 0.25), max(0, n_total - 72)))
+
+    def _build_ui(self):
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #0047FF;
+                color: #FFFFFF;
+                font-family: 'Segoe UI', sans-serif;
+            }
+            QFrame#PreviewCard {
+                background-color: #0035C9;
+                border: 1px solid rgba(255, 255, 255, 0.30);
+                border-radius: 10px;
+            }
+            QFrame#VideoPanel {
+                background-color: #FFFFFF;
+                border: 4px solid #FFFFFF;
+                border-radius: 10px;
+            }
+            QPushButton#CtrlBtn {
+                background-color: rgba(255, 255, 255, 0.16);
+                border: 1px solid rgba(255, 255, 255, 0.45);
+                border-radius: 7px;
+                padding: 7px 13px;
+                color: #FFFFFF;
+                font-size: 12px;
+                font-weight: 800;
+            }
+            QPushButton#CtrlBtn:hover {
+                background-color: rgba(255, 255, 255, 0.28);
+                border-color: #FFFFFF;
+            }
+            QPushButton#CtrlBtn:checked {
+                background-color: #FFFFFF;
+                border-color: #FFFFFF;
+                color: #0047FF;
+                font-weight: 900;
+            }
+            QPushButton#PrimaryCtrlBtn {
+                background-color: #FFFFFF;
+                border: none;
+                border-radius: 7px;
+                padding: 8px 18px;
+                color: #0047FF;
+                font-size: 13px;
+                font-weight: 900;
+            }
+            QPushButton#PrimaryCtrlBtn:hover {
+                background-color: #E2EBFF;
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 16)
+        root.setSpacing(10)
+
+        # Barra superiore informativa + selettore anomalia
+        top_bar = QHBoxLayout()
+        self.header_lbl = QLabel(
+            f"VERIFICA VISIVA MICRO-SCATTI: {Path(self.item.path).name}  \u2022  Target: {self.item.target_fps} FPS"
+        )
+        self.header_lbl.setStyleSheet("font-size: 13px; font-weight: 900; color: #FFFFFF;")
+        top_bar.addWidget(self.header_lbl)
+        top_bar.addStretch()
+
+        if len(self.anomaly_frames) > 1:
+            self.next_segment_btn = QPushButton(
+                f"Cambia Segmento Anomalo (1/{len(self.anomaly_frames)}) \u279c"
+            )
+            self.next_segment_btn.setObjectName("CtrlBtn")
+            self.next_segment_btn.setCursor(Qt.PointingHandCursor)
+            self.next_segment_btn.clicked.connect(self._cycle_anomaly_segment)
+            top_bar.addWidget(self.next_segment_btn)
+
+        root.addLayout(top_bar)
+
+        # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Semaforo Bordo & Badge
+        videos_row = QHBoxLayout()
+        videos_row.setSpacing(14)
+
+        # Pannello Sinistro: ORIGINALE
+        self.orig_panel = QFrame()
+        self.orig_panel.setObjectName("VideoPanel")
+        orig_lay = QVBoxLayout(self.orig_panel)
+        orig_lay.setContentsMargins(10, 10, 10, 10)
+        orig_lay.setSpacing(6)
+
+        orig_top = QHBoxLayout()
+        orig_title = QLabel("PRIMA — VIDEO ORIGINALE")
+        orig_title.setStyleSheet("color: #000000; font-size: 12px; font-weight: 900;")
+        self.orig_badge = QLabel("In caricamento...")
+        self.orig_badge.setStyleSheet(
+            "background-color: #E2E8F0; color: #1E293B; font-size: 11px; font-weight: 900; "
+            "padding: 4px 10px; border-radius: 5px;"
+        )
+        orig_top.addWidget(orig_title)
+        orig_top.addStretch()
+        orig_top.addWidget(self.orig_badge)
+        orig_lay.addLayout(orig_top)
+
+        self.orig_img_lbl = QLabel()
+        self.orig_img_lbl.setAlignment(Qt.AlignCenter)
+        self.orig_img_lbl.setMinimumSize(480, 310)
+        self.orig_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
+        orig_lay.addWidget(self.orig_img_lbl, stretch=1)
+
+        self.orig_meta_lbl = QLabel("Frame: —")
+        self.orig_meta_lbl.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700;")
+        orig_lay.addWidget(self.orig_meta_lbl)
+
+        # Pannello Destro: CORRETTO
+        self.fixed_panel = QFrame()
+        self.fixed_panel.setObjectName("VideoPanel")
+        fixed_lay = QVBoxLayout(self.fixed_panel)
+        fixed_lay.setContentsMargins(10, 10, 10, 10)
+        fixed_lay.setSpacing(6)
+
+        fixed_top = QHBoxLayout()
+        fixed_title = QLabel("DOPO — VIDEO CORRETTO (OPTICAL FLOW)")
+        fixed_title.setStyleSheet("color: #0047FF; font-size: 12px; font-weight: 900;")
+        self.fixed_badge = QLabel("In caricamento...")
+        self.fixed_badge.setStyleSheet(
+            "background-color: #DCFCE7; color: #15803D; font-size: 11px; font-weight: 900; "
+            "padding: 4px 10px; border-radius: 5px;"
+        )
+        fixed_top.addWidget(fixed_title)
+        fixed_top.addStretch()
+        fixed_top.addWidget(self.fixed_badge)
+        fixed_lay.addLayout(fixed_top)
+
+        self.fixed_img_lbl = QLabel()
+        self.fixed_img_lbl.setAlignment(Qt.AlignCenter)
+        self.fixed_img_lbl.setMinimumSize(480, 310)
+        self.fixed_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
+        fixed_lay.addWidget(self.fixed_img_lbl, stretch=1)
+
+        self.fixed_meta_lbl = QLabel("Frame: —")
+        self.fixed_meta_lbl.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700;")
+        fixed_lay.addWidget(self.fixed_meta_lbl)
+
+        videos_row.addWidget(self.orig_panel, stretch=1)
+        videos_row.addWidget(self.fixed_panel, stretch=1)
+        root.addLayout(videos_row, stretch=1)
+
+        # Timeline 'Elettrocardiogramma' del Movimento
+        timeline_card = QFrame()
+        timeline_card.setObjectName("PreviewCard")
+        tl_lay = QVBoxLayout(timeline_card)
+        tl_lay.setContentsMargins(12, 8, 12, 10)
+        tl_lay.setSpacing(5)
+
+        tl_hdr = QHBoxLayout()
+        tl_title = QLabel(
+            "GRAFICO DEL MOVIMENTO FRAME-BY-FRAME (Clicca su una tacca rossa per saltare all'istante dello scatto)"
+        )
+        tl_title.setStyleSheet("font-size: 11px; font-weight: 800; color: #FFFFFF;")
+        self.status_progress_lbl = QLabel("")
+        self.status_progress_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #E2EBFF;")
+        tl_hdr.addWidget(tl_title)
+        tl_hdr.addStretch()
+        tl_hdr.addWidget(self.status_progress_lbl)
+        tl_lay.addLayout(tl_hdr)
+
+        self.timeline = MotionTimelineWidget()
+        self.timeline.frame_selected.connect(self._jump_to_step)
+        tl_lay.addWidget(self.timeline)
+        root.addWidget(timeline_card)
+
+        # Barra Controlli: Play/Pausa, Passo-Passo (-1 / +1 Frame), Salta a Scatto, Velocità Microscopio, Differenza Movimento
+        ctrl_card = QFrame()
+        ctrl_card.setObjectName("PreviewCard")
+        ctrl_lay = QHBoxLayout(ctrl_card)
+        ctrl_lay.setContentsMargins(12, 10, 12, 10)
+        ctrl_lay.setSpacing(8)
+
+        self.play_btn = QPushButton("\u23f8 Pausa")
+        self.play_btn.setObjectName("PrimaryCtrlBtn")
+        self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.clicked.connect(self.toggle_play)
+        ctrl_lay.addWidget(self.play_btn)
+
+        self.prev_frame_btn = QPushButton("\u25c0 -1 Frame")
+        self.prev_frame_btn.setObjectName("CtrlBtn")
+        self.prev_frame_btn.setCursor(Qt.PointingHandCursor)
+        self.prev_frame_btn.clicked.connect(lambda: self.step_manual(-1))
+        ctrl_lay.addWidget(self.prev_frame_btn)
+
+        self.next_frame_btn = QPushButton("+1 Frame \u25b6")
+        self.next_frame_btn.setObjectName("CtrlBtn")
+        self.next_frame_btn.setCursor(Qt.PointingHandCursor)
+        self.next_frame_btn.clicked.connect(lambda: self.step_manual(1))
+        ctrl_lay.addWidget(self.next_frame_btn)
+
+        self.jump_glitch_btn = QPushButton("\u26a0 Vai allo Scatto")
+        self.jump_glitch_btn.setObjectName("CtrlBtn")
+        self.jump_glitch_btn.setCursor(Qt.PointingHandCursor)
+        self.jump_glitch_btn.setToolTip("Ferma sul fotogramma esatto del frame duplicato o mancante")
+        self.jump_glitch_btn.clicked.connect(self.jump_to_next_glitch_in_clip)
+        ctrl_lay.addWidget(self.jump_glitch_btn)
+
+        ctrl_lay.addSpacing(10)
+        spd_lbl = QLabel("Velocit\u00e0:")
+        spd_lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #FFFFFF;")
+        ctrl_lay.addWidget(spd_lbl)
+
+        self.speed_group = QButtonGroup(self)
+        for idx_s, (spd_val, spd_text) in enumerate([
+            (0.25, "0.25x Microscopio"),
+            (0.50, "0.5x Lento"),
+            (1.00, "1x Reale"),
+        ]):
+            s_btn = QPushButton(spd_text)
+            s_btn.setCheckable(True)
+            s_btn.setObjectName("CtrlBtn")
+            s_btn.setCursor(Qt.PointingHandCursor)
+            s_btn.setProperty("speed_val", spd_val)
+            if idx_s == 0:
+                s_btn.setChecked(True)
+            self.speed_group.addButton(s_btn, idx_s)
+            ctrl_lay.addWidget(s_btn)
+        self.speed_group.buttonClicked.connect(self._on_speed_changed)
+
+        ctrl_lay.addStretch()
+
+        self.diff_btn = QPushButton("\u25d0 Mostra Differenza Movimento")
+        self.diff_btn.setCheckable(True)
+        self.diff_btn.setObjectName("CtrlBtn")
+        self.diff_btn.setCursor(Qt.PointingHandCursor)
+        self.diff_btn.setToolTip(
+            "Evidenzia la differenza rispetto al fotogramma precedente: se un frame è duplicato il quadro diventa completamente uniforme"
+        )
+        self.diff_btn.toggled.connect(self._on_diff_toggled)
+        ctrl_lay.addWidget(self.diff_btn)
+
+        root.addWidget(ctrl_card)
+
+    def _start_generation_for_current_segment(self):
+        self.timer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.wait()
+
+        s_frame = self._choose_start_frame()
+        self.orig_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
+        self.fixed_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
+        self.play_btn.setEnabled(False)
+
+        self.worker = PreviewGenerationWorker(self.item, start_frame=s_frame, num_frames=72)
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.finished_preview.connect(self._on_worker_finished)
+        self.worker.error.connect(self._on_worker_error)
+        self.worker.start()
+
+    def _on_worker_progress(self, pct: int, msg: str):
+        self.status_progress_lbl.setText(f"{msg} ({pct}%)")
+
+    def _on_worker_error(self, err: str):
+        self.status_progress_lbl.setText(f"Errore: {err}")
+        self.orig_img_lbl.setText(f"Errore generazione preview:\n{err}")
+
+    def _on_worker_finished(self, data: dict):
+        self.preview_data = data
+        self.status_progress_lbl.setText(
+            f"Segmento: frame #{data['start_frame']} \u2192 #{data['start_frame'] + len(data['orig_frames']) - 1}"
+        )
+        self.total_steps = max(len(data["orig_frames"]), len(data["fixed_frames"]), 1)
+        self.current_step = 0
+
+        self.timeline.set_data(
+            data["orig_deltas"],
+            data["orig_status"],
+            data["fixed_deltas"],
+            data["fixed_status"],
+        )
+        self.play_btn.setEnabled(True)
+        self.play_btn.setText("\u23f8 Pausa")
+        self._render_current_step()
+        self._restart_timer()
+
+    def _restart_timer(self):
+        if not self.preview_data:
+            return
+        fps = self.preview_data.get("fps", 24.0) or 24.0
+        interval_ms = max(16, int(round(1000.0 / (fps * self.speed_factor))))
+        self.timer.start(interval_ms)
+
+    def toggle_play(self):
+        if self.timer.isActive():
+            self.timer.stop()
+            self.play_btn.setText("\u25b6 Riproduci")
+        else:
+            self.play_btn.setText("\u23f8 Pausa")
+            self._restart_timer()
+
+    def step_manual(self, delta: int):
+        if not self.preview_data:
+            return
+        if self.timer.isActive():
+            self.timer.stop()
+            self.play_btn.setText("\u25b6 Riproduci")
+        self.current_step = (self.current_step + delta) % self.total_steps
+        self._render_current_step()
+
+    def _jump_to_step(self, step: int):
+        if not self.preview_data:
+            return
+        if self.timer.isActive():
+            self.timer.stop()
+            self.play_btn.setText("\u25b6 Riproduci")
+        self.current_step = max(0, min(step, self.total_steps - 1))
+        self._render_current_step()
+
+    def jump_to_next_glitch_in_clip(self):
+        if not self.preview_data:
+            return
+        statuses = self.preview_data["orig_status"]
+        n = len(statuses)
+        for offset in range(1, n + 1):
+            cand_orig = (self.current_step + offset) % n
+            if statuses[cand_orig] in ("duplicate", "missing_jump"):
+                if self.timer.isActive():
+                    self.timer.stop()
+                    self.play_btn.setText("\u25b6 Riproduci")
+                # Sincronizza lo step con l'indice corrispondente
+                self.current_step = min(cand_orig, self.total_steps - 1)
+                self._render_current_step()
+                return
+
+    def _cycle_anomaly_segment(self):
+        if not self.anomaly_frames:
+            return
+        self.current_anomaly_pos = (self.current_anomaly_pos + 1) % len(self.anomaly_frames)
+        self.next_segment_btn.setText(
+            f"Cambia Segmento Anomalo ({self.current_anomaly_pos + 1}/{len(self.anomaly_frames)}) \u279c"
+        )
+        self._start_generation_for_current_segment()
+
+    def _on_speed_changed(self, btn):
+        self.speed_factor = float(btn.property("speed_val") or 0.25)
+        if self.timer.isActive():
+            self._restart_timer()
+
+    def _on_diff_toggled(self, checked: bool):
+        self.diff_mode = checked
+        self._render_current_step()
+
+    def _advance_frame(self):
+        if not self.preview_data:
+            return
+        self.current_step = (self.current_step + 1) % self.total_steps
+        self._render_current_step()
+
+    @staticmethod
+    def _make_diff_visual(cur_frame: np.ndarray, prev_frame: np.ndarray) -> np.ndarray:
+        """
+        Genera una mappa di movimento ad alta visibilit\u00e0 su sfondo chiaro:
+        - Se il frame è identico (duplicato/bloccato), il quadro resta completamente grigio chiaro uniforme (0 movimento).
+        - Dove c'è movimento reale, i contorni si accendono in Blu Cobalto MONOGRID.
+        """
+        diff = np.abs(cur_frame.astype(np.int16) - prev_frame.astype(np.int16))
+        mag = np.clip(np.mean(diff, axis=2) * 5.5, 0, 255).astype(np.uint8)
+        out = np.full_like(cur_frame, 244, dtype=np.uint8)
+        alpha = (mag.astype(np.float32) / 255.0)[..., None]
+        blue = np.zeros_like(cur_frame, dtype=np.float32)
+        blue[..., 0] = 0.0
+        blue[..., 1] = 71.0
+        blue[..., 2] = 255.0
+        blended = out.astype(np.float32) * (1.0 - alpha) + blue * alpha
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _array_to_pixmap(arr: np.ndarray, target_size) -> QPixmap:
+        h, w, _ = arr.shape
+        qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
+        return QPixmap.fromImage(qimg).scaled(
+            target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+    def _render_current_step(self):
+        if not self.preview_data:
+            return
+        orig_frames = self.preview_data["orig_frames"]
+        fixed_frames = self.preview_data["fixed_frames"]
+        orig_status = self.preview_data["orig_status"]
+        fixed_status = self.preview_data["fixed_status"]
+        orig_deltas = self.preview_data["orig_deltas"]
+        fixed_deltas = self.preview_data["fixed_deltas"]
+        s_frame = self.preview_data["start_frame"]
+
+        idx_o = min(self.current_step, len(orig_frames) - 1)
+        idx_f = min(self.current_step, len(fixed_frames) - 1)
+
+        if self.diff_mode:
+            prev_o = orig_frames[max(0, idx_o - 1)]
+            prev_f = fixed_frames[max(0, idx_f - 1)]
+            disp_o = self._make_diff_visual(orig_frames[idx_o], prev_o)
+            disp_f = self._make_diff_visual(fixed_frames[idx_f], prev_f)
+        else:
+            disp_o = orig_frames[idx_o]
+            disp_f = fixed_frames[idx_f]
+
+        self.orig_img_lbl.setPixmap(self._array_to_pixmap(disp_o, self.orig_img_lbl.size()))
+        self.fixed_img_lbl.setPixmap(self._array_to_pixmap(disp_f, self.fixed_img_lbl.size()))
+
+        # Semaforo Bordo & Badge per ORIGINALE
+        st_o = orig_status[idx_o]
+        if st_o == "duplicate":
+            self.orig_panel.setStyleSheet(
+                "QFrame#VideoPanel { background-color: #FFF1F2; border: 4px solid #DC2626; border-radius: 10px; }"
+            )
+            self.orig_badge.setText("\u26a0 FRAME DUPLICATO / CONGELATO (SCATTO)")
+            self.orig_badge.setStyleSheet(
+                "background-color: #DC2626; color: #FFFFFF; font-size: 11px; font-weight: 900; "
+                "padding: 4px 10px; border-radius: 5px;"
+            )
+        elif st_o == "missing_jump":
+            self.orig_panel.setStyleSheet(
+                "QFrame#VideoPanel { background-color: #FFF7ED; border: 4px solid #EA580C; border-radius: 10px; }"
+            )
+            self.orig_badge.setText("\u26a0 SALTO FRAME MANCANTE (SCATTO)")
+            self.orig_badge.setStyleSheet(
+                "background-color: #EA580C; color: #FFFFFF; font-size: 11px; font-weight: 900; "
+                "padding: 4px 10px; border-radius: 5px;"
+            )
+        else:
+            self.orig_panel.setStyleSheet(
+                "QFrame#VideoPanel { background-color: #FFFFFF; border: 4px solid #FFFFFF; border-radius: 10px; }"
+            )
+            self.orig_badge.setText("Frame Originale")
+            self.orig_badge.setStyleSheet(
+                "background-color: #E2E8F0; color: #1E293B; font-size: 11px; font-weight: 800; "
+                "padding: 4px 10px; border-radius: 5px;"
+            )
+
+        # Semaforo Bordo & Badge per CORRETTO
+        st_f = fixed_status[idx_f]
+        if st_f in ("reconstructed_missing", "reconstructed_dup"):
+            self.fixed_panel.setStyleSheet(
+                "QFrame#VideoPanel { background-color: #F0FDF4; border: 4px solid #16A34A; border-radius: 10px; }"
+            )
+            self.fixed_badge.setText("\u2713 FRAME RICOSTRUITO (OPTICAL FLOW 16-BIT)")
+            self.fixed_badge.setStyleSheet(
+                "background-color: #16A34A; color: #FFFFFF; font-size: 11px; font-weight: 900; "
+                "padding: 4px 10px; border-radius: 5px;"
+            )
+        else:
+            self.fixed_panel.setStyleSheet(
+                "QFrame#VideoPanel { background-color: #FFFFFF; border: 4px solid #16A34A; border-radius: 10px; }"
+            )
+            self.fixed_badge.setText("\u2713 FLUSSO CONTINUO (0 SCATTI)")
+            self.fixed_badge.setStyleSheet(
+                "background-color: #DCFCE7; color: #15803D; font-size: 11px; font-weight: 900; "
+                "padding: 4px 10px; border-radius: 5px;"
+            )
+
+        self.orig_meta_lbl.setText(
+            f"Frame sorgente #{s_frame + idx_o}  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
+        )
+        self.fixed_meta_lbl.setText(
+            f"Frame output #{idx_f + 1}/{len(fixed_frames)}  \u2022  Delta movimento: {fixed_deltas[idx_f]:.2f}"
+        )
+        self.timeline.set_step(self.current_step)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            self.step_manual(-1)
+        elif event.key() == Qt.Key_Right:
+            self.step_manual(1)
+        elif event.key() == Qt.Key_Space:
+            self.toggle_play()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.wait(1500)
+        super().closeEvent(event)
+
+
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.7 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v0.8 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.7")
+        self.setWindowTitle("MONOVIDEOFIX v0.8")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -1008,9 +1855,19 @@ class VideoJudderFixerWindow(QMainWindow):
         self.meta_badge.setStyleSheet(
             "background: transparent; font-size: 12px; color: rgba(255, 255, 255, 0.90); font-weight: 600;"
         )
+        self.preview_btn = QPushButton("\U0001f441 Anteprima & Verifica Correzione")
+        self.preview_btn.setObjectName("PreviewBtn")
+        self.preview_btn.setCursor(Qt.PointingHandCursor)
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.setToolTip(
+            "Apre la finestra di confronto Prima / Dopo con rallentatore 0.25x, semaforo frame duplicati/mancanti e grafico del movimento"
+        )
+        self.preview_btn.clicked.connect(self.open_preview_dialog)
         header_row.addWidget(title_lbl)
         header_row.addStretch()
         header_row.addWidget(self.meta_badge)
+        header_row.addSpacing(10)
+        header_row.addWidget(self.preview_btn)
         card_layout.addLayout(header_row)
 
         metrics_row = QHBoxLayout()
@@ -1215,6 +2072,23 @@ class VideoJudderFixerWindow(QMainWindow):
                 color: #0047FF;
                 font-weight: 900;
             }
+            QPushButton#PreviewBtn {
+                background-color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                padding: 5px 12px;
+                color: #0047FF;
+                font-size: 12px;
+                font-weight: 900;
+            }
+            QPushButton#PreviewBtn:hover {
+                background-color: #E2EBFF;
+                color: #0035C9;
+            }
+            QPushButton#PreviewBtn:disabled {
+                background-color: rgba(255, 255, 255, 0.25);
+                color: rgba(255, 255, 255, 0.65);
+            }
             QPushButton#RowRemoveBtn {
                 background-color: transparent;
                 border: none;
@@ -1272,6 +2146,16 @@ class VideoJudderFixerWindow(QMainWindow):
     def get_selected_row(self) -> int:
         rows = self.table.selectionModel().selectedRows()
         return rows[0].row() if rows else -1
+
+    def open_preview_dialog(self):
+        row = self.get_selected_row()
+        if row < 0 or row >= len(self.batch_items):
+            return
+        item = self.batch_items[row]
+        if not item.meta or not item.analysis:
+            return
+        dlg = PreviewComparisonDialog(self, item)
+        dlg.exec_()
 
     def add_videos_to_batch(self, video_paths: list[str]):
         if self.export_worker and self.export_worker.isRunning():
@@ -1394,6 +2278,7 @@ class VideoJudderFixerWindow(QMainWindow):
 
     def _clear_details_panel(self):
         self.meta_badge.setText("Nessun video selezionato")
+        self.preview_btn.setEnabled(False)
         self.missing_box_val.setText("—")
         self.dup_box_val.setText("—")
         self.cuts_box_val.setText("—")
@@ -1412,6 +2297,7 @@ class VideoJudderFixerWindow(QMainWindow):
         if item.meta and item.analysis:
             meta = item.meta
             analysis = item.analysis
+            self.preview_btn.setEnabled(True)
             self.meta_badge.setText(
                 f"{Path(item.path).name}  •  {meta['width']}x{meta['height']}  •  "
                 f"{meta['fps']:.2f} fps  •  {meta['codec_raw'].upper()} ({meta['pix_fmt']})"
@@ -1425,12 +2311,14 @@ class VideoJudderFixerWindow(QMainWindow):
             self.cuts_box_val.setText(str(len(cuts)))
             self.log_box.setPlainText(item.report_text)
         elif item.error_msg:
+            self.preview_btn.setEnabled(False)
             self.meta_badge.setText(f"{Path(item.path).name} — Errore")
             self.missing_box_val.setText("Err")
             self.dup_box_val.setText("Err")
             self.cuts_box_val.setText("Err")
             self.log_box.setPlainText(f"Errore durante l'analisi:\n{item.error_msg}")
         else:
+            self.preview_btn.setEnabled(False)
             self.meta_badge.setText(f"{Path(item.path).name} — {item.status}")
             self.missing_box_val.setText("...")
             self.dup_box_val.setText("...")
@@ -1569,9 +2457,9 @@ class VideoJudderFixerWindow(QMainWindow):
             item.status = "✓ Completato"
             item.report_text += (
                 f"\n\n[✓] ESPORTAZIONE COMPLETATA!\n"
-                f"    • File salvato     : {out_path}\n"
-                f"    • Anomalie corrette: {fixed} frame\n"
-                f"    • Frame esportati  : {written} @ {item.target_fps} FPS ({item.target_codec.upper()})"
+                f"    File salvato     : {out_path}\n"
+                f"    Anomalie corrette: {fixed} frame\n"
+                f"    Frame esportati  : {written} @ {item.target_fps} FPS ({item.target_codec.upper()})"
             )
             self._refresh_table_row(idx)
             if self.get_selected_row() == idx:
@@ -1612,7 +2500,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.7")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.8")
         except Exception:
             pass
     app = QApplication(sys.argv)
