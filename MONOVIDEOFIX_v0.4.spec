@@ -24,19 +24,6 @@ def _find_binary(name: str) -> str:
 ffmpeg_path = _find_binary("ffmpeg.exe")
 ffprobe_path = _find_binary("ffprobe.exe")
 
-# NOTA ARCHITETTURALE:
-# Non inseriamo ffmpeg.exe e ffprobe.exe in `binaries` del CArchive di PyInstaller,
-# perché il bootloader C di PyInstaller altrimenti li estrarrebbe ad OGNI avvio
-# prima ancora che Python parta (~480 MB di scrittura su disco = 4-6s di ritardo).
-# Invece:
-# 1. Compiliamo l'EXE leggero con PyInstaller (avvio in ~1 secondo).
-# 2. Subito dopo `EXE(...)`, appendiamo in coda allo stesso file `.exe` un archivio ZIP
-#    compresso contenente `ffmpeg.exe` e `ffprobe.exe`.
-# 3. All'avvio, Python controlla se `ffmpeg` e `ffprobe` sono già nel PC (PATH o cache
-#    in %LOCALAPPDATA%\MonoVideoFix\bin). Se ci sono già, salta completamente l'estrazione!
-#    Se non ci sono (es. primo avvio su un PC nuovo senza FFmpeg), li estrae dallo ZIP
-#    incorporato nell'EXE dentro la cache persistente.
-
 a = Analysis(
     ['video_judder_gui.py'],
     pathex=[],
@@ -60,7 +47,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MONOVIDEOFIX_v0.3',
+    name='MONOVIDEOFIX_v0.4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -76,8 +63,8 @@ exe = EXE(
     icon=['monovideofix.ico'],
 )
 
-# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v0.3.exe
-built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v0.3.exe"
+# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v0.4.exe
+built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v0.4.exe"
 if built_exe.is_file():
     print(f"[MONOVIDEOFIX] Incorporamento on-demand di ffmpeg.exe e ffprobe.exe in {built_exe.name}...")
     with zipfile.ZipFile(built_exe, mode="a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
