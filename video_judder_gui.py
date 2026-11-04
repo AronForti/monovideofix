@@ -973,6 +973,8 @@ class PreviewGenerationWorker(QThread):
             fixed_frames: list[np.ndarray] = []
             fixed_status: list[str] = []
             fixed_from_orig_idx: list[int] = []
+            aligned_orig_frames: list[np.ndarray] = []
+            aligned_orig_indices: list[int] = []
 
             n_seg = len(orig_frames)
             last_written = orig_frames[0]
@@ -985,15 +987,32 @@ class PreviewGenerationWorker(QThread):
 
                 # Stato del fotogramma nel video Originale (esattamente 1 tacca per l'errore selezionato)
                 if (g_idx - 1) in duplicate_set:
-                    orig_status.append("duplicate")
+                    st_orig = "duplicate"
                 elif g_idx in missing_set:
-                    orig_status.append("missing_jump")
+                    st_orig = "missing_jump"
                 else:
-                    orig_status.append("normal")
+                    st_orig = "normal"
 
                 # Ricostruzione fotogrammi nel video Corretto
                 if g_idx in drop_dup_set:
-                    pass
+                    # Quando un duplicato puro viene rimosso, mostriamo comunque lo step comparativo
+                    # allineato con l'interpolazione fra precedente e successivo per mantenere 1:1 le colonne
+                    if next_f is not None:
+                        mid16 = interpolate_midpoint_16bit(
+                            last_written.astype(np.uint16) << 8,
+                            next_f.astype(np.uint16) << 8,
+                            alpha=0.5,
+                        )
+                        mid8 = (mid16 >> 8).astype(np.uint8)
+                        fixed_frames.append(mid8)
+                    else:
+                        fixed_frames.append(cur_f)
+                    fixed_status.append("reconstructed_dup")
+                    fixed_from_orig_idx.append(k)
+                    aligned_orig_frames.append(cur_f)
+                    aligned_orig_indices.append(g_idx)
+                    orig_status.append("duplicate")
+                    last_written = fixed_frames[-1]
                 elif pending_replace and next_f is not None:
                     self.progress.emit(
                         20 + int(65 * k / max(n_seg, 1)),
@@ -1008,12 +1027,18 @@ class PreviewGenerationWorker(QThread):
                     fixed_frames.append(mid8)
                     fixed_status.append("reconstructed_dup")
                     fixed_from_orig_idx.append(k)
+                    aligned_orig_frames.append(cur_f)
+                    aligned_orig_indices.append(g_idx)
+                    orig_status.append(st_orig)
                     last_written = mid8
                     pending_replace = False
                 else:
                     fixed_frames.append(cur_f)
                     fixed_status.append("normal")
                     fixed_from_orig_idx.append(k)
+                    aligned_orig_frames.append(cur_f)
+                    aligned_orig_indices.append(g_idx)
+                    orig_status.append("normal")
                     last_written = cur_f
 
                 if (g_idx + 1) in replace_dup_set:
@@ -1033,6 +1058,10 @@ class PreviewGenerationWorker(QThread):
                     fixed_frames.append(mid8)
                     fixed_status.append("reconstructed_missing")
                     fixed_from_orig_idx.append(k)
+                    # Sull'originale il fotogramma è mancante (mostra il salto/blocco sullo stesso step della barra verde)
+                    aligned_orig_frames.append(next_f)
+                    aligned_orig_indices.append(g_idx + 1)
+                    orig_status.append("missing_jump")
                     last_written = mid8
 
             self.progress.emit(90, "Calcolo curva del movimento frame-by-frame...")
@@ -1055,7 +1084,7 @@ class PreviewGenerationWorker(QThread):
                     deltas[0] = deltas[1]
                 return deltas
 
-            orig_deltas = compute_deltas(orig_frames)
+            orig_deltas = compute_deltas(aligned_orig_frames)
             fixed_deltas = compute_deltas(fixed_frames)
 
             self.progress.emit(100, "Anteprima pronta!")
@@ -1063,7 +1092,8 @@ class PreviewGenerationWorker(QThread):
                 "start_frame": s_frame,
                 "fps": fps,
                 "target_fps": self.item.target_fps,
-                "orig_frames": orig_frames,
+                "orig_frames": aligned_orig_frames,
+                "orig_frame_numbers": aligned_orig_indices,
                 "orig_deltas": orig_deltas,
                 "orig_status": orig_status,
                 "fixed_frames": fixed_frames,
@@ -1079,22 +1109,24 @@ class PreviewGenerationWorker(QThread):
 
 class MotionTimelineWidget(QWidget):
     """
-    Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame):
-    Mostra i due tracciati (Originale sopra, Corretto sotto) evidenziando in ROSSO
-    i frame congelati/ripetuti o i salti di frame mancanti, e in VERDE i frame ricostruiti.
-    Cliccando sul grafico si salta istantaneamente a quel fotogramma.
+    Timeline a Celle Contigue Frame-by-Frame (Stile Editor Video Professionale):
+    - Ogni fotogramma è rappresentato da un blocco/cella contigua a larghezza piena (separata solo da 1px),
+      eliminando il vuoto bianco fuorviante tra un fotogramma e l'altro.
+    - Allineamento 1:1 perfetto tra corsia ORIGINALE (sopra), corsia CORRETTO (sotto) e il cursore/colonna
+      del fotogramma attivo: la selezione cade sempre esattamente sopra la cella e la barra del frame corrente.
     """
 
     frame_selected = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(118)
+        self.setMinimumHeight(124)
         self.setCursor(Qt.PointingHandCursor)
         self.orig_deltas: list[float] = []
         self.orig_status: list[str] = []
         self.fixed_deltas: list[float] = []
         self.fixed_status: list[str] = []
+        self.orig_frame_numbers: list[int] = []
         self.current_step: int = 0
         self.total_steps: int = 1
 
@@ -1104,11 +1136,13 @@ class MotionTimelineWidget(QWidget):
         orig_status: list[str],
         fixed_deltas: list[float],
         fixed_status: list[str],
+        orig_frame_numbers: list[int] | None = None,
     ):
         self.orig_deltas = orig_deltas
         self.orig_status = orig_status
         self.fixed_deltas = fixed_deltas
         self.fixed_status = fixed_status
+        self.orig_frame_numbers = orig_frame_numbers or []
         self.total_steps = max(len(orig_deltas), len(fixed_deltas), 1)
         self.current_step = 0
         self.update()
@@ -1117,18 +1151,21 @@ class MotionTimelineWidget(QWidget):
         self.current_step = max(0, min(step, self.total_steps - 1))
         self.update()
 
+    def _step_from_x(self, x_pos: float) -> int:
+        left_pad = 138.0
+        right_pad = 12.0
+        usable_w = max(10.0, self.width() - left_pad - right_pad)
+        rel_x = max(0.0, min(usable_w - 0.001, x_pos - left_pad))
+        slot_w = usable_w / max(self.total_steps, 1)
+        return max(0, min(int(rel_x // slot_w), self.total_steps - 1))
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.total_steps > 1:
-            left_pad = 135.0
-            right_pad = 14.0
-            usable_w = max(10.0, self.width() - left_pad - right_pad)
-            rel_x = max(0.0, min(usable_w, event.pos().x() - left_pad))
-            step = int(round((rel_x / usable_w) * (self.total_steps - 1)))
-            self.frame_selected.emit(step)
+        if event.button() == Qt.LeftButton and self.total_steps >= 1:
+            self.frame_selected.emit(self._step_from_x(event.pos().x()))
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton and self.total_steps > 1:
-            self.mousePressEvent(event)
+        if event.buttons() & Qt.LeftButton and self.total_steps >= 1:
+            self.frame_selected.emit(self._step_from_x(event.pos().x()))
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1142,79 +1179,157 @@ class MotionTimelineWidget(QWidget):
         if not self.orig_deltas and not self.fixed_deltas:
             p.setPen(QColor("#64748B"))
             p.setFont(QFont("Segoe UI", 10, QFont.Bold))
-            p.drawText(rect, Qt.AlignCenter, "Generazione del grafico del movimento frame-by-frame in corso...")
+            p.drawText(rect, Qt.AlignCenter, "Generazione della timeline dei fotogrammi in corso...")
             p.end()
             return
 
-        left_pad = 135.0
-        right_pad = 14.0
+        left_pad = 138.0
+        right_pad = 12.0
+        header_h = 20.0
         w = rect.width()
         h = rect.height()
         usable_w = max(10.0, w - left_pad - right_pad)
+        n = max(len(self.orig_deltas), len(self.fixed_deltas), 1)
+        slot_w = usable_w / n
 
         all_vals = (self.orig_deltas or [1.0]) + (self.fixed_deltas or [1.0])
-        max_val = max(float(np.percentile(all_vals, 96)) * 1.35, 1.0)
+        max_val = max(float(np.percentile(all_vals, 96)) * 1.30, 1.0)
 
-        # Divisore orizzontale tra corsia Originale (sopra) e Corretto (sotto)
-        mid_y = h * 0.50
-        p.setPen(QPen(QColor("#E2E8F0"), 1.0))
-        p.drawLine(QPointF(8, mid_y), QPointF(w - 8, mid_y))
+        tracks_top = header_h + 2.0
+        tracks_bottom = h - 4.0
+        mid_y = tracks_top + (tracks_bottom - tracks_top) * 0.50
+
+        # Sfondo griglia celle contigue (elimina l'effetto "barre isolate nel vuoto bianco")
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#E2E8F0"))
+        p.drawRoundedRect(QRectF(left_pad - 1.0, 4.0, usable_w + 2.0, h - 8.0), 6.0, 6.0)
 
         # Etichette corsie a sinistra
+        p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        p.setPen(QColor("#64748B"))
+        p.drawText(
+            QRectF(10, 3, left_pad - 14, header_h - 2),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "FRAME #",
+        )
+
         p.setFont(QFont("Segoe UI", 8, QFont.ExtraBold))
         p.setPen(QColor("#DC2626"))
         p.drawText(
-            QRectF(10, 6, left_pad - 16, mid_y - 10),
+            QRectF(10, tracks_top + 2, left_pad - 14, mid_y - tracks_top - 4),
             Qt.AlignLeft | Qt.AlignVCenter,
-            "ORIGINALE\n(Rosso = Scatto/Blocco)",
+            "ORIGINALE\n(Rosso = Errore)",
         )
         p.setPen(QColor("#16A34A"))
         p.drawText(
-            QRectF(10, mid_y + 4, left_pad - 16, mid_y - 10),
+            QRectF(10, mid_y + 2, left_pad - 14, tracks_bottom - mid_y - 4),
             Qt.AlignLeft | Qt.AlignVCenter,
             "CORRETTO\n(Verde = Ricostruito)",
         )
 
-        def draw_bars(deltas: list[float], statuses: list[str], top_y: float, bottom_y: float, is_fixed: bool):
-            n = len(deltas)
-            if n == 0:
-                return
-            bar_slot = usable_w / n
-            bar_w = max(2.0, min(9.0, bar_slot * 0.76))
-            lane_h = bottom_y - top_y - 8.0
-            base_y = bottom_y - 4.0
+        # Disegna ogni fotogramma come una cella contigua (gap di appena 1.5px tra fotogrammi adiacenti)
+        gap = 1.5
+        for i in range(n):
+            cell_x = left_pad + i * slot_w + gap * 0.5
+            cell_w = max(4.0, slot_w - gap)
+            is_cur = (i == self.current_step)
 
-            for i, (val, st) in enumerate(zip(deltas, statuses)):
-                x = left_pad + i * bar_slot + (bar_slot - bar_w) * 0.5
-                norm_h = min(1.0, val / max_val) * lane_h
-                bar_h = max(3.0, norm_h)
+            st_o = self.orig_status[i] if i < len(self.orig_status) else "normal"
+            st_f = self.fixed_status[i] if i < len(self.fixed_status) else "normal"
+            val_o = self.orig_deltas[i] if i < len(self.orig_deltas) else 0.0
+            val_f = self.fixed_deltas[i] if i < len(self.fixed_deltas) else 0.0
+            f_num = self.orig_frame_numbers[i] if i < len(self.orig_frame_numbers) else (i + 1)
 
-                if not is_fixed:
-                    if st == "duplicate":
-                        color = QColor("#DC2626")  # Rosso vivo: frame congelato (delta ~ 0)
-                        bar_h = lane_h  # Tacca rossa a tutta altezza per renderlo visibilissimo
-                    elif st == "missing_jump":
-                        color = QColor("#EA580C")  # Arancio/Rosso: salto per frame mancante
-                    else:
-                        color = QColor("#94A3B8")
+            # 1. Cella Header con numero del fotogramma
+            hdr_rect = QRectF(cell_x, 5.0, cell_w, header_h - 3.0)
+            p.setPen(Qt.NoPen)
+            if is_cur:
+                p.setBrush(QColor("#0047FF"))
+            elif st_o in ("duplicate", "missing_jump"):
+                p.setBrush(QColor("#FEE2E2"))
+            else:
+                p.setBrush(QColor("#F1F5F9"))
+            p.drawRoundedRect(hdr_rect, 3.0, 3.0)
+
+            if cell_w >= 20.0:
+                p.setFont(QFont("Segoe UI", 7, QFont.ExtraBold if is_cur else QFont.Bold))
+                if is_cur:
+                    p.setPen(QColor("#FFFFFF"))
+                elif st_o in ("duplicate", "missing_jump"):
+                    p.setPen(QColor("#DC2626"))
                 else:
-                    if st in ("reconstructed_missing", "reconstructed_dup"):
-                        color = QColor("#16A34A")  # Verde brillante: frame ricostruito Optical Flow
-                    else:
-                        color = QColor("#0047FF")  # Blu MONOGRID: flusso continuo
+                    p.setPen(QColor("#475569"))
+                p.drawText(hdr_rect, Qt.AlignCenter, f"#{f_num}")
 
-                p.setPen(Qt.NoPen)
-                p.setBrush(color)
-                p.drawRoundedRect(QRectF(x, base_y - bar_h, bar_w, bar_h), 1.5, 1.5)
+            # 2. Cella Corsia Superiore (ORIGINALE)
+            orig_cell = QRectF(cell_x, tracks_top + 1.0, cell_w, (mid_y - tracks_top) - 2.0)
+            p.setPen(Qt.NoPen)
+            if st_o in ("duplicate", "missing_jump"):
+                p.setBrush(QColor("#FEF2F2"))
+            elif is_cur:
+                p.setBrush(QColor("#EFF6FF"))
+            else:
+                p.setBrush(QColor("#F8FAFC"))
+            p.drawRoundedRect(orig_cell, 3.0, 3.0)
 
-        draw_bars(self.orig_deltas, self.orig_status, 4.0, mid_y, is_fixed=False)
-        draw_bars(self.fixed_deltas, self.fixed_status, mid_y + 2.0, h - 2.0, is_fixed=True)
+            # Riempimento movimento Originale dentro la cella (a tutta larghezza della cella!)
+            inner_pad = 2.0
+            max_bar_h_o = max(4.0, orig_cell.height() - 4.0)
+            if st_o == "duplicate":
+                bar_h_o = max_bar_h_o
+                bar_col_o = QColor("#DC2626")
+            elif st_o == "missing_jump":
+                bar_h_o = max_bar_h_o
+                bar_col_o = QColor("#EA580C")
+            else:
+                bar_h_o = max(4.0, min(1.0, val_o / max_val) * max_bar_h_o)
+                bar_col_o = QColor("#64748B") if is_cur else QColor("#94A3B8")
 
-        # Cursore del fotogramma corrente
-        if self.total_steps > 1:
-            play_x = left_pad + (self.current_step / (self.total_steps - 1)) * usable_w
-            p.setPen(QPen(QColor("#0047FF"), 2.2))
-            p.drawLine(QPointF(play_x, 2.0), QPointF(play_x, h - 2.0))
+            bar_rect_o = QRectF(
+                orig_cell.left() + inner_pad,
+                orig_cell.bottom() - 2.0 - bar_h_o,
+                max(2.0, orig_cell.width() - inner_pad * 2.0),
+                bar_h_o,
+            )
+            p.setBrush(bar_col_o)
+            p.drawRoundedRect(bar_rect_o, 2.5, 2.5)
+
+            # 3. Cella Corsia Inferiore (CORRETTO)
+            fixed_cell = QRectF(cell_x, mid_y + 1.0, cell_w, (tracks_bottom - mid_y) - 2.0)
+            p.setPen(Qt.NoPen)
+            if st_f in ("reconstructed_missing", "reconstructed_dup"):
+                p.setBrush(QColor("#F0FDF4"))
+            elif is_cur:
+                p.setBrush(QColor("#EFF6FF"))
+            else:
+                p.setBrush(QColor("#F8FAFC"))
+            p.drawRoundedRect(fixed_cell, 3.0, 3.0)
+
+            max_bar_h_f = max(4.0, fixed_cell.height() - 4.0)
+            bar_h_f = max(4.0, min(1.0, val_f / max_val) * max_bar_h_f)
+            if st_f in ("reconstructed_missing", "reconstructed_dup"):
+                bar_col_f = QColor("#16A34A")
+                bar_h_f = max(bar_h_f, max_bar_h_f * 0.65)
+            else:
+                bar_col_f = QColor("#0047FF") if is_cur else QColor("#3B82F6")
+
+            bar_rect_f = QRectF(
+                fixed_cell.left() + inner_pad,
+                fixed_cell.bottom() - 2.0 - bar_h_f,
+                max(2.0, fixed_cell.width() - inner_pad * 2.0),
+                bar_h_f,
+            )
+            p.setBrush(bar_col_f)
+            p.drawRoundedRect(bar_rect_f, 2.5, 2.5)
+
+        # 4. Riquadro di selezione del Frame Corrente perfettamente sovrapposto alla cella attiva
+        if 0 <= self.current_step < n:
+            cur_x = left_pad + self.current_step * slot_w + gap * 0.5
+            cur_w = max(4.0, slot_w - gap)
+            sel_rect = QRectF(cur_x, 5.0, cur_w, h - 10.0)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#0047FF"), 2.4))
+            p.drawRoundedRect(sel_rect, 4.0, 4.0)
 
         p.end()
 
@@ -1814,6 +1929,7 @@ class PreviewComparisonDialog(QDialog):
             data["orig_status"],
             data["fixed_deltas"],
             data["fixed_status"],
+            data.get("orig_frame_numbers"),
         )
         self.play_btn.setEnabled(True)
         self.play_btn.setText("\u23f8 Pausa")
@@ -1996,6 +2112,7 @@ class PreviewComparisonDialog(QDialog):
         fixed_status = self.preview_data["fixed_status"]
         orig_deltas = self.preview_data["orig_deltas"]
         fixed_deltas = self.preview_data["fixed_deltas"]
+        orig_frame_nums = self.preview_data.get("orig_frame_numbers") or []
         s_frame = self.preview_data["start_frame"]
 
         idx_o = min(self.current_step, len(orig_frames) - 1)
@@ -2018,8 +2135,9 @@ class PreviewComparisonDialog(QDialog):
 
         self._update_panel_indicators(st_o, st_f)
 
+        f_num_orig = orig_frame_nums[idx_o] if idx_o < len(orig_frame_nums) else (s_frame + idx_o)
         self.orig_meta_lbl.setText(
-            f"Frame sorgente #{s_frame + idx_o}  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
+            f"Frame sorgente #{f_num_orig}  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
         )
         self.fixed_meta_lbl.setText(
             f"Frame output #{idx_f + 1}/{len(fixed_frames)}  \u2022  Delta movimento: {fixed_deltas[idx_f]:.2f}"
@@ -2037,11 +2155,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.1 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.2 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.1")
+        self.setWindowTitle("MONOVIDEOFIX v1.2")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2811,7 +2929,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.2")
         except Exception:
             pass
     app = QApplication(sys.argv)
