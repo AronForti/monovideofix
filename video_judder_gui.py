@@ -883,17 +883,26 @@ class DropAreaWidget(QWidget):
 
 
 class PreviewGenerationWorker(QThread):
-    """Genera i fotogrammi affiancati Prima (Originale) / Dopo (Corretto Optical Flow) per uno spezzone diagnostico."""
+    """Genera i fotogrammi affiancati Prima (Originale) / Dopo (Corretto Optical Flow) per il singolo errore selezionato."""
 
     progress = pyqtSignal(int, str)
     finished_preview = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, item: BatchVideoItem, start_frame: int, num_frames: int = 80):
+    def __init__(
+        self,
+        item: BatchVideoItem,
+        start_frame: int,
+        num_frames: int = 24,
+        focus_anomaly_frame: int | None = None,
+        focus_anomaly_type: str | None = None,
+    ):
         super().__init__()
         self.item = item
         self.start_frame = start_frame
         self.num_frames = num_frames
+        self.focus_anomaly_frame = focus_anomaly_frame
+        self.focus_anomaly_type = focus_anomaly_type
 
     def run(self):
         try:
@@ -906,11 +915,11 @@ class PreviewGenerationWorker(QThread):
 
             fps = meta["fps"] or 24.0
             n_total = analysis["num_frames"]
-            s_frame = max(0, min(self.start_frame, max(0, n_total - 10)))
+            s_frame = max(0, min(self.start_frame, max(0, n_total - 4)))
             count = min(self.num_frames, n_total - s_frame)
             start_sec = s_frame / fps
 
-            self.progress.emit(10, "Estrazione fotogrammi del segmento selezionato...")
+            self.progress.emit(10, "Estrazione fotogrammi del momento selezionato...")
             cmd = [
                 get_ffmpeg_bin("ffmpeg"),
                 "-v", "error",
@@ -938,8 +947,18 @@ class PreviewGenerationWorker(QThread):
             if len(orig_frames) < 3:
                 raise RuntimeError("Impossibile decodificare abbastanza fotogrammi per la preview.")
 
-            missing_set = set(analysis["missing_indices"])
-            duplicate_set = set(analysis["duplicate_indices"])
+            # Isola esclusivamente il singolo errore associato alla thumbnail selezionata (1 thumbnail = 1 errore)
+            if self.focus_anomaly_frame is not None:
+                if self.focus_anomaly_type == "duplicate":
+                    missing_set = set()
+                    duplicate_set = {self.focus_anomaly_frame}
+                else:
+                    missing_set = {self.focus_anomaly_frame}
+                    duplicate_set = set()
+            else:
+                missing_set = set()
+                duplicate_set = set()
+
             ratios = analysis["ratios"]
 
             replace_dup_set = set()
@@ -964,8 +983,8 @@ class PreviewGenerationWorker(QThread):
                 cur_f = orig_frames[k]
                 next_f = orig_frames[k + 1] if (k + 1 < n_seg) else None
 
-                # Stato del fotogramma nel video Originale
-                if (g_idx - 1) in duplicate_set or g_idx in drop_dup_set or g_idx in replace_dup_set:
+                # Stato del fotogramma nel video Originale (esattamente 1 tacca per l'errore selezionato)
+                if (g_idx - 1) in duplicate_set:
                     orig_status.append("duplicate")
                 elif g_idx in missing_set:
                     orig_status.append("missing_jump")
@@ -1039,12 +1058,6 @@ class PreviewGenerationWorker(QThread):
             orig_deltas = compute_deltas(orig_frames)
             fixed_deltas = compute_deltas(fixed_frames)
 
-            # Rileva eventuali frame congelati residui (delta quasi 0 quando il movimento medio è presente)
-            med_orig_d = float(np.median(orig_deltas)) if orig_deltas else 0.0
-            for i in range(1, len(orig_frames)):
-                if med_orig_d > 0.6 and orig_deltas[i] < 0.18 and orig_status[i] == "normal":
-                    orig_status[i] = "duplicate"
-
             self.progress.emit(100, "Anteprima pronta!")
             self.finished_preview.emit({
                 "start_frame": s_frame,
@@ -1057,6 +1070,8 @@ class PreviewGenerationWorker(QThread):
                 "fixed_deltas": fixed_deltas,
                 "fixed_status": fixed_status,
                 "fixed_from_orig_idx": fixed_from_orig_idx,
+                "focus_anomaly_frame": self.focus_anomaly_frame,
+                "focus_anomaly_type": self.focus_anomaly_type,
             })
         except Exception as exc:
             self.error.emit(str(exc))
@@ -1353,6 +1368,8 @@ class PreviewComparisonDialog(QDialog):
             for f_idx in self.anomaly_frames
         }
         self.current_anomaly_pos = 0
+        if self.anomaly_frames:
+            self._focus_anomaly_frame = self.anomaly_frames[0]
         self.thumb_cards: dict[int, AnomalyThumbnailCard] = {}
 
         self.timer = QTimer(self)
@@ -1376,12 +1393,37 @@ class PreviewComparisonDialog(QDialog):
         self._sc_space.setContext(Qt.WindowShortcut)
         self._sc_space.activated.connect(self.toggle_play)
 
-    def _choose_start_frame(self) -> int:
+    def _compute_segment_for_anomaly(self, pos_idx: int) -> tuple[int, int, int | None, str | None]:
+        """
+        Calcola l'intervallo di frame centrato esclusivamente sull'anomalia selezionata
+        (evitando di sovrapporsi alle anomalie precedenti o successive) così che a ogni
+        thumbnail corrisponda sempre 1 solo errore nella barra sottostante.
+        """
         n_total = self.analysis["num_frames"]
-        if self.anomaly_frames:
-            target = self.anomaly_frames[self.current_anomaly_pos % len(self.anomaly_frames)]
-            return max(0, min(target - 12, max(0, n_total - 72)))
-        return max(0, min(int(n_total * 0.25), max(0, n_total - 72)))
+        if not self.anomaly_frames:
+            s_f = max(0, min(int(n_total * 0.25), max(0, n_total - 24)))
+            return s_f, min(24, n_total - s_f), None, None
+
+        pos = pos_idx % len(self.anomaly_frames)
+        target = self.anomaly_frames[pos]
+        a_type = self.anomaly_types.get(target, "missing_jump")
+
+        half_win = 10  # ~20-21 fotogrammi centrati sul singolo errore
+        low = max(0, target - half_win)
+        high = min(n_total - 1, target + half_win)
+
+        if pos > 0:
+            prev_anom = self.anomaly_frames[pos - 1]
+            mid_prev = (prev_anom + target) // 2 + 1
+            low = max(low, min(mid_prev, target - 3))
+        if pos + 1 < len(self.anomaly_frames):
+            next_anom = self.anomaly_frames[pos + 1]
+            mid_next = (target + next_anom) // 2
+            high = min(high, max(mid_next, target + 3))
+
+        low = max(0, min(low, max(0, n_total - 8)))
+        count = max(8, min(n_total - low, high - low + 1))
+        return low, count, target, a_type
 
     def _build_ui(self):
         self.setStyleSheet(
@@ -1699,13 +1741,14 @@ class PreviewComparisonDialog(QDialog):
         for idx_c, card in self.thumb_cards.items():
             card.set_selected(idx_c == pos_idx)
 
-        # Se l'anomalia cliccata è già all'interno del segmento caricato, salta subito a quel frame
-        if self.preview_data:
+        # Se la thumbnail selezionata è già caricata come unico errore corrente, salta al suo fotogramma
+        if self.preview_data and self.preview_data.get("focus_anomaly_frame") == target_frame:
             s_frame = self.preview_data["start_frame"]
-            n_orig = len(self.preview_data["orig_frames"])
-            if s_frame + 4 <= target_frame < s_frame + n_orig - 4:
-                self._jump_to_step(target_frame - s_frame)
-                return
+            anom_step = target_frame - s_frame
+            if self.preview_data.get("focus_anomaly_type") == "duplicate":
+                anom_step += 1
+            self._jump_to_step(anom_step)
+            return
 
         self._focus_anomaly_frame = target_frame
         self._start_generation_for_current_segment()
@@ -1715,14 +1758,20 @@ class PreviewComparisonDialog(QDialog):
         if self.worker and self.worker.isRunning():
             self.worker.wait()
 
-        s_frame = self._choose_start_frame()
+        s_frame, num_f, focus_f, focus_t = self._compute_segment_for_anomaly(self.current_anomaly_pos)
         self._last_orig_state = ""
         self._last_fixed_state = ""
         self.orig_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.fixed_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.play_btn.setEnabled(False)
 
-        self.worker = PreviewGenerationWorker(self.item, start_frame=s_frame, num_frames=72)
+        self.worker = PreviewGenerationWorker(
+            self.item,
+            start_frame=s_frame,
+            num_frames=num_f,
+            focus_anomaly_frame=focus_f,
+            focus_anomaly_type=focus_t,
+        )
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.finished_preview.connect(self._on_worker_finished)
         self.worker.error.connect(self._on_worker_error)
@@ -1737,13 +1786,24 @@ class PreviewComparisonDialog(QDialog):
 
     def _on_worker_finished(self, data: dict):
         self.preview_data = data
-        self.status_progress_lbl.setText(
-            f"Segmento: frame #{data['start_frame']} \u2192 #{data['start_frame'] + len(data['orig_frames']) - 1}"
-        )
+        focus_f = data.get("focus_anomaly_frame")
+        if focus_f is not None:
+            self.status_progress_lbl.setText(
+                f"Errore #{self.current_anomaly_pos + 1}/{len(self.anomaly_frames)} (frame #{focus_f})  \u2022  "
+                f"Finestra: #{data['start_frame']} \u2192 #{data['start_frame'] + len(data['orig_frames']) - 1}"
+            )
+        else:
+            self.status_progress_lbl.setText(
+                f"Segmento: frame #{data['start_frame']} \u2192 #{data['start_frame'] + len(data['orig_frames']) - 1}"
+            )
         self.total_steps = max(len(data["orig_frames"]), len(data["fixed_frames"]), 1)
 
         if self._focus_anomaly_frame is not None:
-            rel_step = max(0, min(self._focus_anomaly_frame - data["start_frame"], self.total_steps - 1))
+            target_step = self._focus_anomaly_frame - data["start_frame"]
+            if data.get("focus_anomaly_type") == "duplicate":
+                target_step += 1
+            # Avvia la riproduzione pochi frame prima dell'errore così si osserva subito il passaggio
+            rel_step = max(0, min(target_step - 3, self.total_steps - 1))
             self.current_step = rel_step
             self._focus_anomaly_frame = None
         else:
@@ -1977,11 +2037,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.0 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.1 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.0")
+        self.setWindowTitle("MONOVIDEOFIX v1.1")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2751,7 +2811,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.0")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.1")
         except Exception:
             pass
     app = QApplication(sys.argv)
