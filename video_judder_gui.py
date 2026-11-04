@@ -55,6 +55,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QShortcut,
     QTableWidget,
     QTableWidgetItem,
@@ -1203,13 +1204,124 @@ class MotionTimelineWidget(QWidget):
         p.end()
 
 
+class AnomalyThumbnailsWorker(QThread):
+    """Estrae in background le miniature (thumbnail) dei vari momenti in cui si verifica un frame duplicato o mancante."""
+
+    thumb_ready = pyqtSignal(int, int, QImage)
+
+    def __init__(self, video_path: str, fps: float, anomaly_frames: list[int]):
+        super().__init__()
+        self.video_path = video_path
+        self.fps = fps or 24.0
+        self.anomaly_frames = anomaly_frames
+        self._abort = False
+
+    def stop(self):
+        self._abort = True
+
+    def run(self):
+        tw, th = 112, 64
+        frame_bytes = tw * th * 3
+        for pos, f_idx in enumerate(self.anomaly_frames):
+            if self._abort:
+                break
+            t_sec = f_idx / self.fps
+            cmd = [
+                get_ffmpeg_bin("ffmpeg"),
+                "-v", "error",
+                "-ss", f"{t_sec:.4f}",
+                "-i", self.video_path,
+                "-frames:v", "1",
+                "-vf", f"scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-",
+            ]
+            try:
+                raw = subprocess.check_output(cmd, **get_subprocess_kwargs())
+                if len(raw) >= frame_bytes:
+                    arr = np.frombuffer(raw[:frame_bytes], dtype=np.uint8).reshape((th, tw, 3)).copy()
+                    qimg = QImage(arr.data, tw, th, tw * 3, QImage.Format_RGB888).copy()
+                    self.thumb_ready.emit(pos, f_idx, qimg)
+            except Exception:
+                pass
+
+
+class AnomalyThumbnailCard(QFrame):
+    """Card cliccabile con miniatura del momento esatto in cui avviene un frame duplicato o mancante."""
+
+    clicked = pyqtSignal(int)
+
+    def __init__(self, pos_idx: int, frame_idx: int, time_sec: float, anomaly_type: str):
+        super().__init__()
+        self.pos_idx = pos_idx
+        self.frame_idx = frame_idx
+        self.anomaly_type = anomaly_type
+        self._selected = False
+
+        self.setFixedSize(128, 100)
+        self.setCursor(Qt.PointingHandCursor)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 5, 6, 5)
+        lay.setSpacing(3)
+
+        self.img_lbl = QLabel("...")
+        self.img_lbl.setFixedSize(114, 62)
+        self.img_lbl.setAlignment(Qt.AlignCenter)
+        self.img_lbl.setStyleSheet(
+            "background-color: #E2E8F0; color: #64748B; font-size: 10px; font-weight: 700; border-radius: 4px;"
+        )
+        lay.addWidget(self.img_lbl, alignment=Qt.AlignCenter)
+
+        tag_short = "DUPLICATO" if anomaly_type == "duplicate" else "MANCANTE"
+        tag_color = "#DC2626" if anomaly_type == "duplicate" else "#D97706"
+        self.info_lbl = QLabel(f"#{frame_idx} ({time_sec:.2f}s) \u2022 {tag_short}")
+        self.info_lbl.setAlignment(Qt.AlignCenter)
+        self.info_lbl.setFixedHeight(18)
+        self.info_lbl.setStyleSheet(
+            f"background: transparent; border: none; color: {tag_color}; font-size: 9px; font-weight: 800;"
+        )
+        lay.addWidget(self.info_lbl)
+
+        self._apply_card_style()
+
+    def set_thumbnail(self, qimg: QImage):
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.img_lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.img_lbl.setText("")
+        self.img_lbl.setPixmap(pix)
+
+    def set_selected(self, selected: bool):
+        if self._selected != selected:
+            self._selected = selected
+            self._apply_card_style()
+
+    def _apply_card_style(self):
+        if self._selected:
+            self.setStyleSheet(
+                "AnomalyThumbnailCard { background-color: #FFFFFF; border: 2px solid #0047FF; border-radius: 7px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "AnomalyThumbnailCard { background-color: rgba(255, 255, 255, 0.88); border: 2px solid transparent; border-radius: 7px; }"
+                "AnomalyThumbnailCard:hover { background-color: #FFFFFF; border: 2px solid #93C5FD; }"
+            )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.pos_idx)
+
+
 class PreviewComparisonDialog(QDialog):
     """
     Finestra di Anteprima Confronto Prima / Dopo (Opzione 1 con strumenti diagnostici):
-    1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Navigazione frame tramite frecce Sinistra/Destra + Salta a Anomalia.
-    2. Semaforo statico a zero jitter su Bordo & Badge (dimensioni fisse, nessun ricalcolo layout).
-    3. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
-    4. Modalità 'Heat-Map Movimento' ad alta chiarezza (sovrapposizione termica dei pixel in movimento sul video desaturato).
+    1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Navigazione frame tramite frecce Sinistra/Destra.
+    2. Galleria di Thumbnail cliccabili per ciascun momento in cui avviene un frame duplicato o mancante.
+    3. Semaforo statico a zero jitter su Bordo & Badge (dimensioni fisse, nessun ricalcolo layout).
+    4. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
+    5. Modalità 'Heat-Map Movimento' ad alta chiarezza (sovrapposizione termica dei pixel in movimento sul video desaturato).
     """
 
     def __init__(self, parent: QWidget, item: BatchVideoItem):
@@ -1220,7 +1332,7 @@ class PreviewComparisonDialog(QDialog):
 
         self.setWindowTitle(f"Anteprima & Verifica Correzione — {Path(item.path).name}")
         self.setWindowIcon(create_app_icon())
-        self.setMinimumSize(1080, 740)
+        self.setMinimumSize(1080, 830)
 
         self.preview_data: dict | None = None
         self.current_step: int = 0
@@ -1228,20 +1340,27 @@ class PreviewComparisonDialog(QDialog):
         self.speed_factor: float = 0.25  # Default 0.25x (Rallentatore Microscopio per rendere palese ogni scatto)
         self.diff_mode: bool = False
         self.worker: PreviewGenerationWorker | None = None
+        self.thumb_worker: AnomalyThumbnailsWorker | None = None
         self._last_orig_state: str = ""
         self._last_fixed_state: str = ""
+        self._focus_anomaly_frame: int | None = None
 
-        self.anomaly_frames = sorted(
-            set(self.analysis.get("missing_indices", []))
-            | set(self.analysis.get("duplicate_indices", []))
-        )
+        missing_set = set(self.analysis.get("missing_indices", []))
+        dup_set = set(self.analysis.get("duplicate_indices", []))
+        self.anomaly_frames = sorted(missing_set | dup_set)
+        self.anomaly_types = {
+            f_idx: ("duplicate" if f_idx in dup_set else "missing_jump")
+            for f_idx in self.anomaly_frames
+        }
         self.current_anomaly_pos = 0
+        self.thumb_cards: dict[int, AnomalyThumbnailCard] = {}
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance_frame)
 
         self._build_ui()
         self._setup_shortcuts()
+        self._start_thumbnails_worker()
         self._start_generation_for_current_segment()
 
     def _setup_shortcuts(self):
@@ -1282,6 +1401,23 @@ class PreviewComparisonDialog(QDialog):
                 border: 2px solid #E2E8F0;
                 border-radius: 10px;
             }
+            QScrollArea#ThumbScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:horizontal {
+                background: rgba(255, 255, 255, 0.15);
+                height: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #FFFFFF;
+                min-width: 30px;
+                border-radius: 4px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
             QPushButton#CtrlBtn {
                 background-color: rgba(255, 255, 255, 0.16);
                 border: 1px solid rgba(255, 255, 255, 0.45);
@@ -1320,7 +1456,7 @@ class PreviewComparisonDialog(QDialog):
         root.setContentsMargins(18, 14, 18, 16)
         root.setSpacing(10)
 
-        # Barra superiore informativa + selettore anomalia
+        # Barra superiore informativa
         top_bar = QHBoxLayout()
         self.header_lbl = QLabel(
             f"VERIFICA VISIVA MICRO-SCATTI: {Path(self.item.path).name}  \u2022  Target: {self.item.target_fps} FPS"
@@ -1328,17 +1464,6 @@ class PreviewComparisonDialog(QDialog):
         self.header_lbl.setStyleSheet("font-size: 13px; font-weight: 900; color: #FFFFFF;")
         top_bar.addWidget(self.header_lbl)
         top_bar.addStretch()
-
-        if len(self.anomaly_frames) > 1:
-            self.next_segment_btn = QPushButton(
-                f"Cambia Segmento Anomalo (1/{len(self.anomaly_frames)}) \u279c"
-            )
-            self.next_segment_btn.setObjectName("CtrlBtn")
-            self.next_segment_btn.setCursor(Qt.PointingHandCursor)
-            self.next_segment_btn.setFocusPolicy(Qt.NoFocus)
-            self.next_segment_btn.clicked.connect(self._cycle_anomaly_segment)
-            top_bar.addWidget(self.next_segment_btn)
-
         root.addLayout(top_bar)
 
         # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Badge compatti a larghezza/altezza fissa (zero scatti UI)
@@ -1371,7 +1496,7 @@ class PreviewComparisonDialog(QDialog):
 
         self.orig_img_lbl = QLabel()
         self.orig_img_lbl.setAlignment(Qt.AlignCenter)
-        self.orig_img_lbl.setMinimumSize(480, 310)
+        self.orig_img_lbl.setMinimumSize(480, 290)
         self.orig_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
         orig_lay.addWidget(self.orig_img_lbl, stretch=1)
 
@@ -1406,7 +1531,7 @@ class PreviewComparisonDialog(QDialog):
 
         self.fixed_img_lbl = QLabel()
         self.fixed_img_lbl.setAlignment(Qt.AlignCenter)
-        self.fixed_img_lbl.setMinimumSize(480, 310)
+        self.fixed_img_lbl.setMinimumSize(480, 290)
         self.fixed_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
         fixed_lay.addWidget(self.fixed_img_lbl, stretch=1)
 
@@ -1418,6 +1543,59 @@ class PreviewComparisonDialog(QDialog):
         videos_row.addWidget(self.orig_panel, stretch=1)
         videos_row.addWidget(self.fixed_panel, stretch=1)
         root.addLayout(videos_row, stretch=1)
+
+        # Galleria Thumbnail dei momenti con Frame Duplicato o Mancante
+        thumbs_card = QFrame()
+        thumbs_card.setObjectName("PreviewCard")
+        thumbs_lay = QVBoxLayout(thumbs_card)
+        thumbs_lay.setContentsMargins(12, 8, 12, 8)
+        thumbs_lay.setSpacing(6)
+
+        thumbs_hdr = QHBoxLayout()
+        n_anom = len(self.anomaly_frames)
+        thumbs_title = QLabel(
+            f"MOMENTI RILEVATI CON FRAME DUPLICATO O MANCANTE ({n_anom}) — Clicca su una miniatura per ispezionare il punto esatto"
+            if n_anom > 0
+            else "MOMENTI RILEVATI CON FRAME DUPLICATO O MANCANTE (Nessuna anomalia rilevata nel video)"
+        )
+        thumbs_title.setStyleSheet("font-size: 11px; font-weight: 800; color: #FFFFFF;")
+        thumbs_hdr.addWidget(thumbs_title)
+        thumbs_hdr.addStretch()
+        thumbs_lay.addLayout(thumbs_hdr)
+
+        self.thumb_scroll = QScrollArea()
+        self.thumb_scroll.setObjectName("ThumbScroll")
+        self.thumb_scroll.setWidgetResizable(True)
+        self.thumb_scroll.setFixedHeight(114)
+        self.thumb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.thumb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.thumb_scroll.setFocusPolicy(Qt.NoFocus)
+
+        thumb_container = QWidget()
+        thumb_container.setStyleSheet("background: transparent;")
+        self.thumb_strip_lay = QHBoxLayout(thumb_container)
+        self.thumb_strip_lay.setContentsMargins(2, 2, 2, 2)
+        self.thumb_strip_lay.setSpacing(8)
+
+        fps_src = self.meta.get("fps", 24.0) or 24.0
+        if self.anomaly_frames:
+            for pos_idx, f_idx in enumerate(self.anomaly_frames):
+                t_sec = (f_idx + 1) / fps_src
+                a_type = self.anomaly_types.get(f_idx, "missing_jump")
+                card = AnomalyThumbnailCard(pos_idx, f_idx, t_sec, a_type)
+                card.set_selected(pos_idx == self.current_anomaly_pos)
+                card.clicked.connect(self._on_thumbnail_clicked)
+                self.thumb_cards[pos_idx] = card
+                self.thumb_strip_lay.addWidget(card)
+        else:
+            empty_lbl = QLabel("Nessun frame duplicato o mancante rilevato in questo video.")
+            empty_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.85); font-size: 12px; font-weight: 600;")
+            self.thumb_strip_lay.addWidget(empty_lbl)
+
+        self.thumb_strip_lay.addStretch()
+        self.thumb_scroll.setWidget(thumb_container)
+        thumbs_lay.addWidget(self.thumb_scroll)
+        root.addWidget(thumbs_card)
 
         # Timeline 'Elettrocardiogramma' del Movimento
         timeline_card = QFrame()
@@ -1443,7 +1621,7 @@ class PreviewComparisonDialog(QDialog):
         tl_lay.addWidget(self.timeline)
         root.addWidget(timeline_card)
 
-        # Barra Controlli: Play/Pausa, Salta a Scatto, Velocità Microscopio, Heat-Map Movimento
+        # Barra Controlli: Play/Pausa, Velocità Microscopio, Heat-Map Movimento
         ctrl_card = QFrame()
         ctrl_card.setObjectName("PreviewCard")
         ctrl_lay = QHBoxLayout(ctrl_card)
@@ -1456,14 +1634,6 @@ class PreviewComparisonDialog(QDialog):
         self.play_btn.setFocusPolicy(Qt.NoFocus)
         self.play_btn.clicked.connect(self.toggle_play)
         ctrl_lay.addWidget(self.play_btn)
-
-        self.jump_glitch_btn = QPushButton("\u26a0 Vai allo Scatto")
-        self.jump_glitch_btn.setObjectName("CtrlBtn")
-        self.jump_glitch_btn.setCursor(Qt.PointingHandCursor)
-        self.jump_glitch_btn.setFocusPolicy(Qt.NoFocus)
-        self.jump_glitch_btn.setToolTip("Ferma sul fotogramma esatto del frame duplicato o mancante")
-        self.jump_glitch_btn.clicked.connect(self.jump_to_next_glitch_in_clip)
-        ctrl_lay.addWidget(self.jump_glitch_btn)
 
         ctrl_lay.addSpacing(10)
         spd_lbl = QLabel("Velocit\u00e0:")
@@ -1505,6 +1675,41 @@ class PreviewComparisonDialog(QDialog):
 
         root.addWidget(ctrl_card)
 
+    def _start_thumbnails_worker(self):
+        if not self.anomaly_frames:
+            return
+        self.thumb_worker = AnomalyThumbnailsWorker(
+            self.meta["path"],
+            self.meta.get("fps", 24.0) or 24.0,
+            self.anomaly_frames,
+        )
+        self.thumb_worker.thumb_ready.connect(self._on_thumb_ready)
+        self.thumb_worker.start()
+
+    def _on_thumb_ready(self, pos_idx: int, _frame_idx: int, qimg: QImage):
+        card = self.thumb_cards.get(pos_idx)
+        if card:
+            card.set_thumbnail(qimg)
+
+    def _on_thumbnail_clicked(self, pos_idx: int):
+        if pos_idx < 0 or pos_idx >= len(self.anomaly_frames):
+            return
+        self.current_anomaly_pos = pos_idx
+        target_frame = self.anomaly_frames[pos_idx]
+        for idx_c, card in self.thumb_cards.items():
+            card.set_selected(idx_c == pos_idx)
+
+        # Se l'anomalia cliccata è già all'interno del segmento caricato, salta subito a quel frame
+        if self.preview_data:
+            s_frame = self.preview_data["start_frame"]
+            n_orig = len(self.preview_data["orig_frames"])
+            if s_frame + 4 <= target_frame < s_frame + n_orig - 4:
+                self._jump_to_step(target_frame - s_frame)
+                return
+
+        self._focus_anomaly_frame = target_frame
+        self._start_generation_for_current_segment()
+
     def _start_generation_for_current_segment(self):
         self.timer.stop()
         if self.worker and self.worker.isRunning():
@@ -1536,7 +1741,13 @@ class PreviewComparisonDialog(QDialog):
             f"Segmento: frame #{data['start_frame']} \u2192 #{data['start_frame'] + len(data['orig_frames']) - 1}"
         )
         self.total_steps = max(len(data["orig_frames"]), len(data["fixed_frames"]), 1)
-        self.current_step = 0
+
+        if self._focus_anomaly_frame is not None:
+            rel_step = max(0, min(self._focus_anomaly_frame - data["start_frame"], self.total_steps - 1))
+            self.current_step = rel_step
+            self._focus_anomaly_frame = None
+        else:
+            self.current_step = 0
 
         self.timeline.set_data(
             data["orig_deltas"],
@@ -1582,30 +1793,6 @@ class PreviewComparisonDialog(QDialog):
         self.current_step = max(0, min(step, self.total_steps - 1))
         self._render_current_step()
 
-    def jump_to_next_glitch_in_clip(self):
-        if not self.preview_data:
-            return
-        statuses = self.preview_data["orig_status"]
-        n = len(statuses)
-        for offset in range(1, n + 1):
-            cand_orig = (self.current_step + offset) % n
-            if statuses[cand_orig] in ("duplicate", "missing_jump"):
-                if self.timer.isActive():
-                    self.timer.stop()
-                    self.play_btn.setText("\u25b6 Riproduci")
-                self.current_step = min(cand_orig, self.total_steps - 1)
-                self._render_current_step()
-                return
-
-    def _cycle_anomaly_segment(self):
-        if not self.anomaly_frames:
-            return
-        self.current_anomaly_pos = (self.current_anomaly_pos + 1) % len(self.anomaly_frames)
-        self.next_segment_btn.setText(
-            f"Cambia Segmento Anomalo ({self.current_anomaly_pos + 1}/{len(self.anomaly_frames)}) \u279c"
-        )
-        self._start_generation_for_current_segment()
-
     def _on_speed_changed(self, btn):
         self.speed_factor = float(btn.property("speed_val") or 0.25)
         if self.timer.isActive():
@@ -1628,36 +1815,30 @@ class PreviewComparisonDialog(QDialog):
         - Sfondo: immagine del video desaturata e schiarita (così si riconosce sempre la scena).
         - Zone in movimento: colorate con mappa termica (Blu -> Ciano -> Giallo -> Rosso) proporzionale allo spostamento.
         - Se il frame è DUPLICATO / CONGELATO (movimento ~ 0), l'intera Heat-Map si spegne (grigio neutro)
-          e compare un indicatore visivo in sovrimpressione 'MOVIMENTO ZERO (FRAME RIPETUTO)'.
+          e compare un indicatore visivo in sovrimpressione '0% MOVIMENTO - FRAME FERMO'.
         """
-        # Base monocromatica chiara della scena (per mantenere il riferimento visivo dei soggetti)
         gray = cv2.cvtColor(cur_frame, cv2.COLOR_RGB2GRAY)
         base_val = np.clip(gray.astype(np.float32) * 0.45 + 135.0, 0, 255).astype(np.uint8)
         base_rgb = np.stack([base_val, base_val, base_val], axis=-1)
 
-        # Calcolo differenza assoluta smussata per eliminare il rumore di compressione
         diff_u8 = cv2.absdiff(cur_frame, prev_frame)
         diff_max = np.max(diff_u8, axis=2)
         diff_blur = cv2.GaussianBlur(diff_max, (5, 5), 0)
 
-        # amplificazione della mappa termica (soglia antirumore a 3)
         norm_motion = np.clip((diff_blur.astype(np.float32) - 3.0) * 7.5, 0, 255).astype(np.uint8)
         heat_bgr = cv2.applyColorMap(norm_motion, cv2.COLORMAP_TURBO)
         heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
 
-        # Opacità proporzionale all'intensità del movimento (dove è fermo resta visibile la scena desaturata)
         alpha = np.clip((diff_blur.astype(np.float32) - 3.0) / 26.0, 0.0, 0.88)[..., None]
         out = (base_rgb.astype(np.float32) * (1.0 - alpha) + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
 
         h, w, _ = out.shape
-        # Barra di attività movimento in basso (indicatore analogico immediato)
         bar_h = 8
         cv2.rectangle(out, (0, h - bar_h), (w, h), (226, 232, 240), -1)
         fill_ratio = min(1.0, delta_val / 12.0)
         fill_w = int(round(w * fill_ratio))
 
         if status == "duplicate" or delta_val < 0.18:
-            # Riquadro e pillola rossa di allerta quando il frame è congelato (0 movimento)
             cv2.rectangle(out, (2, 2), (w - 3, h - 3), (220, 38, 38), 3)
             overlay = out.copy()
             cv2.rectangle(overlay, (12, 12), (min(w - 12, 340), 44), (220, 38, 38), -1)
@@ -1692,7 +1873,7 @@ class PreviewComparisonDialog(QDialog):
     def _update_panel_indicators(self, st_o: str, st_f: str):
         """
         Aggiorna testo e colori dei badge/bordi SOLO quando lo stato cambia e mantenendo
-        spessori di bordo (2px 패널, 1px badge) e dimensioni (195x22) rigorosamente identici
+        spessori di bordo (2px pannello, 1px badge) e dimensioni (195x22) rigorosamente identici
         in ogni stato, eliminando qualsiasi micro-scatto o ricalcolo della UI.
         """
         if st_o != self._last_orig_state:
@@ -1787,17 +1968,20 @@ class PreviewComparisonDialog(QDialog):
 
     def closeEvent(self, event):
         self.timer.stop()
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            self.thumb_worker.stop()
+            self.thumb_worker.wait(800)
         if self.worker and self.worker.isRunning():
             self.worker.wait(1500)
         super().closeEvent(event)
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.9 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.0 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.9")
+        self.setWindowTitle("MONOVIDEOFIX v1.0")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2567,7 +2751,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.9")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.0")
         except Exception:
             pass
     app = QApplication(sys.argv)
