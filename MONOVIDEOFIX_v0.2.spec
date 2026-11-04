@@ -51,7 +51,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MONOVIDEOFIX_v0.1',
+    name='MONOVIDEOFIX_v0.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

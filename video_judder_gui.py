@@ -819,11 +819,11 @@ class DropAreaWidget(QWidget):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.1 in stile MONOGRID (Bianco e Blu Cobalto)."""
+    """Finestra principale MONOVIDEOFIX v0.2 (Bianco e Blu Cobalto)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.1 — MONOGRID")
+        self.setWindowTitle("MONOVIDEOFIX v0.2")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -870,32 +870,6 @@ class VideoJudderFixerWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(20, 16, 20, 18)
         root.setSpacing(12)
-
-        # 0. Top Brand Header MONOGRID — MONOVIDEOFIX v0.1
-        brand_bar = QHBoxLayout()
-        brand_bar.setSpacing(10)
-
-        logo_lbl = QLabel()
-        logo_lbl.setPixmap(render_monovideofix_pixmap(36))
-        logo_lbl.setFixedSize(36, 36)
-
-        title_col = QVBoxLayout()
-        title_col.setSpacing(0)
-        app_title = QLabel("MONOVIDEOFIX v0.1")
-        app_title.setStyleSheet(
-            "background: transparent; font-size: 18px; font-weight: 900; color: #0047FF; letter-spacing: 0.8px;"
-        )
-        app_sub = QLabel("MONOGRID  •  SEEDANCE FPS & JUDDER REPAIR TOOL")
-        app_sub.setStyleSheet(
-            "background: transparent; font-size: 10px; font-weight: 700; color: #64748B; letter-spacing: 1.2px;"
-        )
-        title_col.addWidget(app_title)
-        title_col.addWidget(app_sub)
-
-        brand_bar.addWidget(logo_lbl)
-        brand_bar.addLayout(title_col)
-        brand_bar.addStretch()
-        root.addLayout(brand_bar)
 
         # 1. Area Drag & Drop
         self.drop_area = DropAreaWidget()
@@ -1582,7 +1556,7 @@ class VideoJudderFixerWindow(QMainWindow):
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.2")
         except Exception:
             pass
     app = QApplication(sys.argv)

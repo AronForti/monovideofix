@@ -1,12 +1,12 @@
 ========================================================================
-MONOVIDEOFIX v0.1 — MONOGRID (Versione Portable)
+MONOVIDEOFIX v0.2 (Versione Portable)
 Seedance FPS & Judder Repair Tool
 ========================================================================
 
 Nessuna installazione richiesta (include già Python, OpenCV, PyQt5 e FFmpeg).
 
 COME USARE IL PROGRAMMA:
-1. Fai doppio clic su "MONOVIDEOFIX_v0.1.exe" per avviare l'applicazione.
+1. Fai doppio clic su "MONOVIDEOFIX_v0.2.exe" per avviare l'applicazione.
 2. Trascina uno o più file video (o un'intera cartella) in qualsiasi punto
    della finestra.
 3. Il programma analizzerà automaticamente ciascun video stimando:
