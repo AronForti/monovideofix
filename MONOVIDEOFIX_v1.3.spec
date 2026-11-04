@@ -47,7 +47,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MONOVIDEOFIX_v1.2',
+    name='MONOVIDEOFIX_v1.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -63,8 +63,8 @@ exe = EXE(
     icon=['monovideofix.ico'],
 )
 
-# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v1.2.exe
-built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v1.2.exe"
+# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v1.3.exe
+built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v1.3.exe"
 if built_exe.is_file():
     print(f"[MONOVIDEOFIX] Incorporamento on-demand di ffmpeg.exe e ffprobe.exe in {built_exe.name}...")
     with zipfile.ZipFile(built_exe, mode="a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:

@@ -909,7 +909,7 @@ class PreviewGenerationWorker(QThread):
             meta = self.item.meta
             analysis = self.item.analysis
             w_src, h_src = meta["width"], meta["height"]
-            scale = min(1.0, 560.0 / max(w_src, 1), 350.0 / max(h_src, 1))
+            scale = min(1.0, 1120.0 / max(w_src, 1), 700.0 / max(h_src, 1))
             pw = max(64, int(round(w_src * scale / 2)) * 2)
             ph = max(64, int(round(h_src * scale / 2)) * 2)
 
@@ -1444,6 +1444,234 @@ class AnomalyThumbnailCard(QFrame):
             self.clicked.emit(self.pos_idx)
 
 
+class SyncZoomVideoView(QWidget):
+    """
+    Visualizzatore video interattivo con Zoom (rotellina del mouse) e Pan/Trascinamento (click sinistro),
+    progettato per sincronizzare in tempo reale ingrandimento e posizione con il frame di confronto:
+    - Rotellina del mouse: Zoom progressivo (1.0x .. 8.0x) centrato esattamente sul punto sotto il cursore.
+    - Trascinamento (Click sinistro + muovi): Sposta l'inquadratura quando zoomato (> 1.0x).
+    - Doppio click sinistro (o tasto destro): Ripristina istantaneamente la vista al 100% (1.0x).
+    - Qualsiasi modifica emette `view_changed(zoom, center_u, center_v)` per replicare all'istante
+      lo stesso identico zoom e movimento sull'altro pannello (Prima <-> Dopo).
+    """
+
+    view_changed = pyqtSignal(float, float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(480, 290)
+        self._qimg: QImage | None = None
+        self._placeholder_text: str = "In caricamento..."
+        self._zoom: float = 1.0
+        self._min_zoom: float = 1.0
+        self._max_zoom: float = 8.0
+        # Coordinate normalizzate (0.0 .. 1.0) del centro dell'immagine attualmente visibile
+        self._center_u: float = 0.5
+        self._center_v: float = 0.5
+        self._dragging: bool = False
+        self._last_mouse_pos: QPointF = QPointF()
+        self.setMouseTracking(True)
+        self._update_cursor()
+
+    def setText(self, text: str):
+        self._placeholder_text = text
+        self._qimg = None
+        self.update()
+
+    def set_frame_array(self, arr: np.ndarray):
+        h, w, _ = arr.shape
+        self._qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        self.update()
+
+    def _clamp_center(self):
+        if self._zoom <= 1.0001:
+            self._zoom = 1.0
+            self._center_u = 0.5
+            self._center_v = 0.5
+        else:
+            half_span = 0.5 / self._zoom
+            self._center_u = max(half_span, min(1.0 - half_span, self._center_u))
+            self._center_v = max(half_span, min(1.0 - half_span, self._center_v))
+
+    def _update_cursor(self):
+        if self._dragging:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._zoom > 1.001:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+
+    def set_view_state(self, zoom: float, center_u: float, center_v: float, emit_signal: bool = False):
+        self._zoom = max(self._min_zoom, min(self._max_zoom, float(zoom)))
+        self._center_u = float(center_u)
+        self._center_v = float(center_v)
+        self._clamp_center()
+        self._update_cursor()
+        self.update()
+        if emit_signal:
+            self.view_changed.emit(self._zoom, self._center_u, self._center_v)
+
+    def reset_zoom(self, emit_signal: bool = True):
+        self.set_view_state(1.0, 0.5, 0.5, emit_signal=emit_signal)
+
+    def step_zoom(self, factor: float, emit_signal: bool = True):
+        new_zoom = max(self._min_zoom, min(self._max_zoom, self._zoom * factor))
+        self.set_view_state(new_zoom, self._center_u, self._center_v, emit_signal=emit_signal)
+
+    def zoom_level(self) -> float:
+        return self._zoom
+
+    def _compute_dest_rect(self) -> QRectF:
+        w = max(1.0, float(self.width()))
+        h = max(1.0, float(self.height()))
+        if self._qimg is None or self._qimg.isNull():
+            return QRectF(0.0, 0.0, w, h)
+        iw = float(self._qimg.width())
+        ih = float(self._qimg.height())
+        scale = min(w / iw, h / ih)
+        dw = iw * scale
+        dh = ih * scale
+        dx = (w - dw) * 0.5
+        dy = (h - dh) * 0.5
+        return QRectF(dx, dy, dw, dh)
+
+    def wheelEvent(self, event):
+        if self._qimg is None or self._qimg.isNull():
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.22 if delta > 0 else (1.0 / 1.22)
+        old_zoom = self._zoom
+        new_zoom = max(self._min_zoom, min(self._max_zoom, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-4:
+            return
+
+        dest = self._compute_dest_rect()
+        if dest.width() > 1.0 and dest.height() > 1.0:
+            pos = event.pos()
+            rel_x = max(0.0, min(1.0, (pos.x() - dest.left()) / dest.width()))
+            rel_y = max(0.0, min(1.0, (pos.y() - dest.top()) / dest.height()))
+            # Punto dell'immagine (0..1) attualmente sotto il cursore
+            u_cursor = self._center_u + (rel_x - 0.5) / old_zoom
+            v_cursor = self._center_v + (rel_y - 0.5) / old_zoom
+            # Mantieni lo stesso punto dell'immagine ancorato sotto il cursore al nuovo zoom
+            self._center_u = u_cursor - (rel_x - 0.5) / new_zoom
+            self._center_v = v_cursor - (rel_y - 0.5) / new_zoom
+
+        self._zoom = new_zoom
+        self._clamp_center()
+        self._update_cursor()
+        self.update()
+        self.view_changed.emit(self._zoom, self._center_u, self._center_v)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._zoom > 1.001:
+            self._dragging = True
+            self._last_mouse_pos = QPointF(event.pos())
+            self._update_cursor()
+            event.accept()
+        elif event.button() == Qt.RightButton and self._zoom > 1.001:
+            self.reset_zoom(emit_signal=True)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._qimg is not None and not self._qimg.isNull():
+            cur_pos = QPointF(event.pos())
+            delta = cur_pos - self._last_mouse_pos
+            self._last_mouse_pos = cur_pos
+            dest = self._compute_dest_rect()
+            if dest.width() > 1.0 and dest.height() > 1.0:
+                du = -delta.x() / (dest.width() * self._zoom)
+                dv = -delta.y() / (dest.height() * self._zoom)
+                self._center_u += du
+                self._center_v += dv
+                self._clamp_center()
+                self.update()
+                self.view_changed.emit(self._zoom, self._center_u, self._center_v)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._update_cursor()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if self._zoom > 1.001:
+                self.reset_zoom(emit_signal=True)
+            elif self._qimg is not None and not self._qimg.isNull():
+                # Doppio click a 1.0x -> ingrandisce a 2.5x nel punto cliccato
+                dest = self._compute_dest_rect()
+                new_zoom = 2.5
+                if dest.width() > 1.0 and dest.height() > 1.0:
+                    pos = event.pos()
+                    rel_x = max(0.0, min(1.0, (pos.x() - dest.left()) / dest.width()))
+                    rel_y = max(0.0, min(1.0, (pos.y() - dest.top()) / dest.height()))
+                    self._center_u = rel_x
+                    self._center_v = rel_y
+                self.set_view_state(new_zoom, self._center_u, self._center_v, emit_signal=True)
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        rect = QRectF(0.0, 0.0, float(self.width()), float(self.height()))
+        bg_path = QPainterPath()
+        bg_path.addRoundedRect(rect, 6.0, 6.0)
+        p.fillPath(bg_path, QColor("#F8FAFC"))
+
+        if self._qimg is None or self._qimg.isNull():
+            p.setPen(QColor("#334155"))
+            p.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
+            p.drawText(rect, Qt.AlignCenter, self._placeholder_text)
+            return
+
+        p.save()
+        p.setClipPath(bg_path)
+
+        iw = float(self._qimg.width())
+        ih = float(self._qimg.height())
+        src_w = iw / self._zoom
+        src_h = ih / self._zoom
+        src_x = self._center_u * iw - src_w * 0.5
+        src_y = self._center_v * ih - src_h * 0.5
+        src_rect = QRectF(src_x, src_y, src_w, src_h)
+        dest_rect = self._compute_dest_rect()
+
+        p.drawImage(dest_rect, self._qimg, src_rect)
+
+        # Badge compatto in sovrimpressione quando lo zoom è attivo (> 1.0x)
+        if self._zoom > 1.01:
+            badge_text = f"🔍 {self._zoom:.1f}x Sync"
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            fm = p.fontMetrics()
+            bw = fm.horizontalAdvance(badge_text) + 14
+            bh = 20
+            bx = dest_rect.right() - bw - 8
+            by = dest_rect.top() + 8
+            b_rect = QRectF(bx, by, float(bw), float(bh))
+            p.setPen(QPen(QColor("#0047FF"), 1.2))
+            p.setBrush(QColor(255, 255, 255, 232))
+            p.drawRoundedRect(b_rect, 5.0, 5.0)
+            p.setPen(QColor("#0047FF"))
+            p.drawText(b_rect, Qt.AlignCenter, badge_text)
+
+        p.restore()
+
+
 class PreviewComparisonDialog(QDialog):
     """
     Finestra di Anteprima Confronto Prima / Dopo (Opzione 1 con strumenti diagnostici):
@@ -1452,6 +1680,7 @@ class PreviewComparisonDialog(QDialog):
     3. Semaforo statico a zero jitter su Bordo & Badge (dimensioni fisse, nessun ricalcolo layout).
     4. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
     5. Modalità 'Heat-Map Movimento' ad alta chiarezza (sovrapposizione termica dei pixel in movimento sul video desaturato).
+    6. Zoom e Pan sincronizzati in tempo reale tra il frame Originale e il frame Corretto.
     """
 
     def __init__(self, parent: QWidget, item: BatchVideoItem):
@@ -1619,8 +1848,11 @@ class PreviewComparisonDialog(QDialog):
             f"VERIFICA VISIVA MICRO-SCATTI: {Path(self.item.path).name}  \u2022  Target: {self.item.target_fps} FPS"
         )
         self.header_lbl.setStyleSheet("font-size: 13px; font-weight: 900; color: #FFFFFF;")
+        zoom_hint_lbl = QLabel("🔍 Rotellina: Zoom sincronizzato  •  Trascina: Sposta vista  •  Doppio click: Reset 100%")
+        zoom_hint_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #E2EBFF;")
         top_bar.addWidget(self.header_lbl)
         top_bar.addStretch()
+        top_bar.addWidget(zoom_hint_lbl)
         root.addLayout(top_bar)
 
         # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Badge compatti a larghezza/altezza fissa (zero scatti UI)
@@ -1651,10 +1883,12 @@ class PreviewComparisonDialog(QDialog):
         orig_top.addWidget(self.orig_badge)
         orig_lay.addLayout(orig_top)
 
-        self.orig_img_lbl = QLabel()
-        self.orig_img_lbl.setAlignment(Qt.AlignCenter)
-        self.orig_img_lbl.setMinimumSize(480, 290)
-        self.orig_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
+        self.orig_img_lbl = SyncZoomVideoView()
+        self.orig_img_lbl.setToolTip(
+            "Rotellina del mouse: Zoom avanti/indietro sincronizzato\n"
+            "Click sinistro + trascina: Sposta l'inquadratura su entrambi i frame\n"
+            "Doppio click (o tasto destro): Reset vista al 100%"
+        )
         orig_lay.addWidget(self.orig_img_lbl, stretch=1)
 
         self.orig_meta_lbl = QLabel("Frame: —")
@@ -1686,11 +1920,17 @@ class PreviewComparisonDialog(QDialog):
         fixed_top.addWidget(self.fixed_badge)
         fixed_lay.addLayout(fixed_top)
 
-        self.fixed_img_lbl = QLabel()
-        self.fixed_img_lbl.setAlignment(Qt.AlignCenter)
-        self.fixed_img_lbl.setMinimumSize(480, 290)
-        self.fixed_img_lbl.setStyleSheet("background-color: #F8FAFC; border-radius: 6px; color: #334155;")
+        self.fixed_img_lbl = SyncZoomVideoView()
+        self.fixed_img_lbl.setToolTip(
+            "Rotellina del mouse: Zoom avanti/indietro sincronizzato\n"
+            "Click sinistro + trascina: Sposta l'inquadratura su entrambi i frame\n"
+            "Doppio click (o tasto destro): Reset vista al 100%"
+        )
         fixed_lay.addWidget(self.fixed_img_lbl, stretch=1)
+
+        # Sincronizzazione bidirezionale di Zoom e Movimento tra PRIMA e DOPO
+        self.orig_img_lbl.view_changed.connect(self._on_orig_view_changed)
+        self.fixed_img_lbl.view_changed.connect(self._on_fixed_view_changed)
 
         self.fixed_meta_lbl = QLabel("Frame: —")
         self.fixed_meta_lbl.setFixedHeight(18)
@@ -1778,7 +2018,7 @@ class PreviewComparisonDialog(QDialog):
         tl_lay.addWidget(self.timeline)
         root.addWidget(timeline_card)
 
-        # Barra Controlli: Play/Pausa, Velocità Microscopio, Heat-Map Movimento
+        # Barra Controlli: Play/Pausa, Velocità Microscopio, Zoom Sincronizzato, Heat-Map Movimento
         ctrl_card = QFrame()
         ctrl_card.setObjectName("PreviewCard")
         ctrl_lay = QHBoxLayout(ctrl_card)
@@ -1815,6 +2055,35 @@ class PreviewComparisonDialog(QDialog):
             ctrl_lay.addWidget(s_btn)
         self.speed_group.buttonClicked.connect(self._on_speed_changed)
 
+        ctrl_lay.addSpacing(12)
+        zoom_lbl = QLabel("Zoom:")
+        zoom_lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #FFFFFF;")
+        ctrl_lay.addWidget(zoom_lbl)
+
+        self.zoom_out_btn = QPushButton("−")
+        self.zoom_out_btn.setObjectName("CtrlBtn")
+        self.zoom_out_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_out_btn.setFocusPolicy(Qt.NoFocus)
+        self.zoom_out_btn.setToolTip("Riduci zoom su entrambi i frame")
+        self.zoom_out_btn.clicked.connect(lambda: self.orig_img_lbl.step_zoom(1.0 / 1.35, emit_signal=True))
+        ctrl_lay.addWidget(self.zoom_out_btn)
+
+        self.zoom_reset_btn = QPushButton("100%")
+        self.zoom_reset_btn.setObjectName("CtrlBtn")
+        self.zoom_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_reset_btn.setFocusPolicy(Qt.NoFocus)
+        self.zoom_reset_btn.setToolTip("Ripristina zoom al 100% (1.0x) su entrambi i frame")
+        self.zoom_reset_btn.clicked.connect(lambda: self.orig_img_lbl.reset_zoom(emit_signal=True))
+        ctrl_lay.addWidget(self.zoom_reset_btn)
+
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setObjectName("CtrlBtn")
+        self.zoom_in_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_in_btn.setFocusPolicy(Qt.NoFocus)
+        self.zoom_in_btn.setToolTip("Ingrandisci su entrambi i frame (oppure usa la rotellina del mouse)")
+        self.zoom_in_btn.clicked.connect(lambda: self.orig_img_lbl.step_zoom(1.35, emit_signal=True))
+        ctrl_lay.addWidget(self.zoom_in_btn)
+
         ctrl_lay.addStretch()
 
         self.diff_btn = QPushButton("\U0001f525 Heat-Map Movimento")
@@ -1824,13 +2093,21 @@ class PreviewComparisonDialog(QDialog):
         self.diff_btn.setFocusPolicy(Qt.NoFocus)
         self.diff_btn.setToolTip(
             "Evidenzia con mappa termica (Blu \u2192 Ciano \u2192 Giallo \u2192 Rosso) lo spostamento reale rispetto al frame precedente:\n"
-            "• Su un frame duplicato/congelato il movimento crolla a ZERO (immagine grigia ferma + banner congelamento)\n"
-            "• Su un frame corretto i contorni in movimento restano sempre accesi e continui"
+            "\u2022 Su un frame duplicato/congelato il movimento crolla a ZERO (immagine grigia ferma + banner congelamento)\n"
+            "\u2022 Su un frame corretto i contorni in movimento restano sempre accesi e continui"
         )
         self.diff_btn.toggled.connect(self._on_diff_toggled)
         ctrl_lay.addWidget(self.diff_btn)
 
         root.addWidget(ctrl_card)
+
+    def _on_orig_view_changed(self, zoom: float, center_u: float, center_v: float):
+        self.fixed_img_lbl.set_view_state(zoom, center_u, center_v, emit_signal=False)
+        self.zoom_reset_btn.setText(f"{int(round(zoom * 100))}%")
+
+    def _on_fixed_view_changed(self, zoom: float, center_u: float, center_v: float):
+        self.orig_img_lbl.set_view_state(zoom, center_u, center_v, emit_signal=False)
+        self.zoom_reset_btn.setText(f"{int(round(zoom * 100))}%")
 
     def _start_thumbnails_worker(self):
         if not self.anomaly_frames:
@@ -2038,14 +2315,6 @@ class PreviewComparisonDialog(QDialog):
 
         return out
 
-    @staticmethod
-    def _array_to_pixmap(arr: np.ndarray, target_size) -> QPixmap:
-        h, w, _ = arr.shape
-        qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
-        return QPixmap.fromImage(qimg).scaled(
-            target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-
     def _update_panel_indicators(self, st_o: str, st_f: str):
         """
         Aggiorna testo e colori dei badge/bordi SOLO quando lo stato cambia e mantenendo
@@ -2130,8 +2399,8 @@ class PreviewComparisonDialog(QDialog):
             disp_o = orig_frames[idx_o]
             disp_f = fixed_frames[idx_f]
 
-        self.orig_img_lbl.setPixmap(self._array_to_pixmap(disp_o, self.orig_img_lbl.size()))
-        self.fixed_img_lbl.setPixmap(self._array_to_pixmap(disp_f, self.fixed_img_lbl.size()))
+        self.orig_img_lbl.set_frame_array(disp_o)
+        self.fixed_img_lbl.set_frame_array(disp_f)
 
         self._update_panel_indicators(st_o, st_f)
 
@@ -2155,11 +2424,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.2 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.3 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.2")
+        self.setWindowTitle("MONOVIDEOFIX v1.3")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2929,7 +3198,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.2")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.3")
         except Exception:
             pass
     app = QApplication(sys.argv)
