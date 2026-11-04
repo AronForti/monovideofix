@@ -765,7 +765,7 @@ def create_app_icon() -> QIcon:
 
 
 class DropAreaWidget(QWidget):
-    """Area Drag & Drop multi-file cliccabile in stile MONOGRID (Bianco/Nero su sfondo Blu)."""
+    """Area Drag & Drop multi-file cliccabile in stile MONOGRID su sfondo Blu."""
 
     files_dropped = pyqtSignal(list)
 
@@ -804,9 +804,9 @@ class DropAreaWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         bg_color = (
-            QColor(0, 0, 0, 95)
+            QColor(255, 255, 255, 45)
             if self._dragging
-            else (QColor(0, 0, 0, 65) if self._hovered else QColor(0, 50, 185, 255))
+            else (QColor(255, 255, 255, 25) if self._hovered else QColor("#0035C9"))
         )
         border_color = (
             QColor("#FFFFFF") if (self._dragging or self._hovered) else QColor(255, 255, 255, 190)
@@ -879,11 +879,11 @@ class DropAreaWidget(QWidget):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.4 (Bianco e Nero su sfondo Blu Cobalto MONOGRID)."""
+    """Finestra principale MONOVIDEOFIX v0.5 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.4")
+        self.setWindowTitle("MONOVIDEOFIX v0.5")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -1014,7 +1014,7 @@ class VideoJudderFixerWindow(QMainWindow):
         )
         self.meta_badge = QLabel("Nessun video selezionato")
         self.meta_badge.setStyleSheet(
-            "background: transparent; font-size: 12px; color: rgba(255, 255, 255, 0.85); font-weight: 600;"
+            "background: transparent; font-size: 12px; color: rgba(255, 255, 255, 0.90); font-weight: 600;"
         )
         header_row.addWidget(title_lbl)
         header_row.addStretch()
@@ -1024,9 +1024,9 @@ class VideoJudderFixerWindow(QMainWindow):
         metrics_row = QHBoxLayout()
         metrics_row.setSpacing(10)
 
-        self.missing_box_val, missing_frame = self._create_metric_box("FRAME MANCANTI STIMATI", "—", "#FFFFFF")
-        self.dup_box_val, dup_frame = self._create_metric_box("FRAME DUPLICATI STIMATI", "—", "#FFFFFF")
-        self.cuts_box_val, cuts_frame = self._create_metric_box("CAMBI SCENA", "—", "#FFFFFF")
+        self.missing_box_val, missing_frame = self._create_metric_box("FRAME MANCANTI STIMATI", "—", "#0047FF")
+        self.dup_box_val, dup_frame = self._create_metric_box("FRAME DUPLICATI STIMATI", "—", "#0047FF")
+        self.cuts_box_val, cuts_frame = self._create_metric_box("CAMBI SCENA", "—", "#000000")
 
         metrics_row.addWidget(missing_frame)
         metrics_row.addWidget(dup_frame)
@@ -1116,7 +1116,7 @@ class VideoJudderFixerWindow(QMainWindow):
         exp_layout.addLayout(codec_row)
 
         self.out_preview_lbl = QLabel("Output: —")
-        self.out_preview_lbl.setStyleSheet("background: transparent; font-size: 12px; color: rgba(255, 255, 255, 0.85);")
+        self.out_preview_lbl.setStyleSheet("background: transparent; font-size: 12px; color: rgba(255, 255, 255, 0.90);")
         exp_layout.addWidget(self.out_preview_lbl)
 
         root.addWidget(export_card)
@@ -1139,12 +1139,12 @@ class VideoJudderFixerWindow(QMainWindow):
 
         t_lbl = QLabel(title)
         t_lbl.setStyleSheet(
-            "background: transparent; border: none; font-size: 10px; font-weight: 700; color: rgba(255, 255, 255, 0.75);"
+            "background: transparent; border: none; font-size: 10px; font-weight: 800; color: #334155;"
         )
 
         v_lbl = QLabel(value)
         v_lbl.setStyleSheet(
-            f"background: transparent; border: none; font-size: 17px; font-weight: 800; color: {accent_color};"
+            f"background: transparent; border: none; font-size: 17px; font-weight: 900; color: {accent_color};"
         )
 
         lay.addWidget(t_lbl)
@@ -1167,50 +1167,50 @@ class VideoJudderFixerWindow(QMainWindow):
             }
             QFrame#Card {
                 background-color: #0035C9;
-                border: 1px solid rgba(255, 255, 255, 0.28);
+                border: 1px solid rgba(255, 255, 255, 0.30);
                 border-radius: 10px;
             }
             QFrame#MetricBox {
-                background-color: #000000;
-                border: 1px solid rgba(255, 255, 255, 0.25);
+                background-color: #FFFFFF;
+                border: none;
                 border-radius: 8px;
             }
             QTableWidget {
-                background-color: #001B6E;
-                border: 1px solid rgba(255, 255, 255, 0.30);
+                background-color: #FFFFFF;
+                border: none;
                 border-radius: 8px;
-                color: #FFFFFF;
+                color: #000000;
                 font-size: 12px;
-                selection-background-color: #FFFFFF;
-                selection-color: #000000;
+                selection-background-color: #E2EBFF;
+                selection-color: #0047FF;
                 outline: none;
             }
             QTableWidget::item:selected {
-                background-color: #FFFFFF;
-                color: #000000;
-                font-weight: 700;
+                background-color: #E2EBFF;
+                color: #0047FF;
+                font-weight: 800;
             }
             QHeaderView::section {
-                background-color: #000000;
-                color: #FFFFFF;
+                background-color: #F0F5FF;
+                color: #0047FF;
                 font-size: 11px;
                 font-weight: 800;
                 padding: 6px 8px;
                 border: none;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.30);
+                border-bottom: 1px solid #D8E2F0;
             }
             QTextEdit {
-                background-color: #000000;
-                border: 1px solid rgba(255, 255, 255, 0.28);
+                background-color: #FFFFFF;
+                border: none;
                 border-radius: 8px;
                 padding: 8px;
-                color: #FFFFFF;
+                color: #000000;
                 font-family: 'Consolas', monospace;
                 font-size: 12px;
             }
             QPushButton#OptionBtn {
-                background-color: #000000;
-                border: 1px solid rgba(255, 255, 255, 0.35);
+                background-color: rgba(255, 255, 255, 0.14);
+                border: 1px solid rgba(255, 255, 255, 0.40);
                 border-radius: 7px;
                 padding: 8px 14px;
                 color: #FFFFFF;
@@ -1220,72 +1220,69 @@ class VideoJudderFixerWindow(QMainWindow):
             QPushButton#OptionBtn:hover {
                 border-color: #FFFFFF;
                 color: #FFFFFF;
-                background-color: #1A1A1A;
+                background-color: rgba(255, 255, 255, 0.25);
             }
             QPushButton#OptionBtn:checked {
                 background-color: #FFFFFF;
                 border-color: #FFFFFF;
-                color: #000000;
-                font-weight: 800;
+                color: #0047FF;
+                font-weight: 900;
             }
             QPushButton#SmallBtn {
-                background-color: #000000;
-                border: 1px solid rgba(255, 255, 255, 0.35);
+                background-color: #FFFFFF;
+                border: none;
                 border-radius: 6px;
-                padding: 4px 10px;
-                color: #FFFFFF;
+                padding: 5px 11px;
+                color: #000000;
                 font-size: 11px;
-                font-weight: 600;
+                font-weight: 700;
             }
             QPushButton#SmallBtn:hover {
-                background-color: #FFFFFF;
-                border-color: #FFFFFF;
-                color: #000000;
+                background-color: #E2EBFF;
+                color: #0047FF;
             }
             QPushButton#SmallAccentBtn {
                 background-color: #FFFFFF;
-                border: 1px solid #FFFFFF;
+                border: none;
                 border-radius: 6px;
-                padding: 4px 10px;
-                color: #000000;
+                padding: 5px 11px;
+                color: #0047FF;
                 font-size: 11px;
                 font-weight: 800;
             }
             QPushButton#SmallAccentBtn:hover {
-                background-color: #000000;
-                border-color: #FFFFFF;
-                color: #FFFFFF;
+                background-color: #E2EBFF;
+                color: #0035C9;
             }
             QPushButton#ExportBtn {
                 background-color: #FFFFFF;
                 border: none;
                 border-radius: 8px;
-                color: #000000;
+                color: #0047FF;
                 font-size: 16px;
                 font-weight: 900;
                 letter-spacing: 1px;
             }
             QPushButton#ExportBtn:hover {
-                background-color: #000000;
-                color: #FFFFFF;
-                border: 1px solid #FFFFFF;
+                background-color: #E2EBFF;
+                color: #0035C9;
             }
             QPushButton#ExportBtn:disabled {
-                background-color: rgba(0, 0, 0, 0.45);
-                color: rgba(255, 255, 255, 0.45);
+                background-color: rgba(255, 255, 255, 0.30);
+                color: rgba(255, 255, 255, 0.65);
             }
             QProgressBar {
-                background-color: #000000;
-                border: 1px solid rgba(255, 255, 255, 0.30);
+                background-color: #FFFFFF;
+                border: none;
                 border-radius: 7px;
                 height: 24px;
                 text-align: center;
-                color: #FFFFFF;
+                color: #000000;
                 font-size: 12px;
-                font-weight: 700;
+                font-weight: 800;
             }
             QProgressBar::chunk {
-                background-color: #0047FF;
+                background-color: #93C5FD;
                 border-radius: 6px;
             }
             """
@@ -1634,7 +1631,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.4")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.5")
         except Exception:
             pass
     app = QApplication(sys.argv)
