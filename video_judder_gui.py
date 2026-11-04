@@ -879,11 +879,11 @@ class DropAreaWidget(QWidget):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v0.5 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v0.6 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v0.5")
+        self.setWindowTitle("MONOVIDEOFIX v0.6")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -950,23 +950,11 @@ class VideoJudderFixerWindow(QMainWindow):
         )
         batch_header.addWidget(self.queue_title_lbl)
         batch_header.addStretch()
-
-        self.remove_sel_btn = QPushButton("Rimuovi selezionato")
-        self.remove_sel_btn.setObjectName("SmallBtn")
-        self.remove_sel_btn.setCursor(Qt.PointingHandCursor)
-        self.remove_sel_btn.clicked.connect(self.remove_selected_item)
-
-        self.clear_all_btn = QPushButton("Svuota lista")
-        self.clear_all_btn.setObjectName("SmallBtn")
-        self.clear_all_btn.setCursor(Qt.PointingHandCursor)
-        self.clear_all_btn.clicked.connect(self.clear_batch)
-
-        batch_header.addWidget(self.remove_sel_btn)
-        batch_header.addWidget(self.clear_all_btn)
         batch_layout.addLayout(batch_header)
 
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels([
+            "",
             "File Video",
             "Sorgente",
             "Frame Mancanti",
@@ -983,10 +971,13 @@ class VideoJudderFixerWindow(QMainWindow):
         self.table.setMinimumHeight(140)
 
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setMinimumSectionSize(28)
+        hdr.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 32)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         batch_layout.addWidget(self.table)
@@ -1228,18 +1219,18 @@ class VideoJudderFixerWindow(QMainWindow):
                 color: #0047FF;
                 font-weight: 900;
             }
-            QPushButton#SmallBtn {
-                background-color: #FFFFFF;
+            QPushButton#RowRemoveBtn {
+                background-color: transparent;
                 border: none;
-                border-radius: 6px;
-                padding: 5px 11px;
-                color: #000000;
-                font-size: 11px;
-                font-weight: 700;
+                border-radius: 4px;
+                color: #64748B;
+                font-size: 13px;
+                font-weight: 900;
+                padding: 0px;
             }
-            QPushButton#SmallBtn:hover {
-                background-color: #E2EBFF;
-                color: #0047FF;
+            QPushButton#RowRemoveBtn:hover {
+                background-color: #FEE2E2;
+                color: #DC2626;
             }
             QPushButton#SmallAccentBtn {
                 background-color: #FFFFFF;
@@ -1324,15 +1315,35 @@ class VideoJudderFixerWindow(QMainWindow):
         if added_any:
             self._start_pending_analyses()
 
+    def _create_row_remove_widget(self, item: BatchVideoItem) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setAlignment(Qt.AlignCenter)
+
+        btn = QPushButton("✕")
+        btn.setObjectName("RowRemoveBtn")
+        btn.setFixedSize(22, 22)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Rimuovi {Path(item.path).name}")
+        btn.clicked.connect(lambda _checked=False, it=item: self.remove_video_item(it))
+        lay.addWidget(btn)
+        return container
+
     def _append_table_row(self, item: BatchVideoItem):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        self.table.setCellWidget(row, 0, self._create_row_remove_widget(item))
         self._refresh_table_row(row)
 
     def _refresh_table_row(self, row: int):
         if row < 0 or row >= len(self.batch_items):
             return
         item = self.batch_items[row]
+        if self.table.cellWidget(row, 0) is None:
+            self.table.setCellWidget(row, 0, self._create_row_remove_widget(item))
+
         name_it = QTableWidgetItem(Path(item.path).name)
         name_it.setToolTip(item.path)
 
@@ -1356,8 +1367,9 @@ class VideoJudderFixerWindow(QMainWindow):
             QTableWidgetItem(miss_str),
             QTableWidgetItem(dup_str),
         ]
-        for col, cell in enumerate(cells):
-            if col > 0:
+        for idx_c, cell in enumerate(cells):
+            col = idx_c + 1
+            if col > 1:
                 cell.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, col, cell)
 
@@ -1375,13 +1387,14 @@ class VideoJudderFixerWindow(QMainWindow):
         )
         self.export_btn.setEnabled(ready_count > 0 and not busy)
 
-    def remove_selected_item(self):
+    def remove_video_item(self, item: BatchVideoItem):
         if (self.analysis_worker and self.analysis_worker.isRunning()) or (
             self.export_worker and self.export_worker.isRunning()
         ):
             return
-        row = self.get_selected_row()
-        if row < 0:
+        try:
+            row = self.batch_items.index(item)
+        except ValueError:
             return
         self.batch_items.pop(row)
         self.table.removeRow(row)
@@ -1390,18 +1403,8 @@ class VideoJudderFixerWindow(QMainWindow):
             self.table.selectRow(min(row, self.table.rowCount() - 1))
         else:
             self._clear_details_panel()
-
-    def clear_batch(self):
-        if (self.analysis_worker and self.analysis_worker.isRunning()) or (
-            self.export_worker and self.export_worker.isRunning()
-        ):
-            return
-        self.batch_items.clear()
-        self.table.setRowCount(0)
-        self._update_queue_header()
-        self._clear_details_panel()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Pronto")
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Pronto")
 
     def _clear_details_panel(self):
         self.meta_badge.setText("Nessun video selezionato")
@@ -1552,8 +1555,6 @@ class VideoJudderFixerWindow(QMainWindow):
 
         self.export_btn.setEnabled(False)
         self.drop_area.setEnabled(False)
-        self.remove_sel_btn.setEnabled(False)
-        self.clear_all_btn.setEnabled(False)
 
         self.export_worker = BatchExportWorker(self.batch_items)
         self.export_worker.item_started.connect(self._on_export_item_started)
@@ -1603,8 +1604,6 @@ class VideoJudderFixerWindow(QMainWindow):
 
     def _on_export_all_finished(self, success_count: int, total_count: int):
         self.drop_area.setEnabled(True)
-        self.remove_sel_btn.setEnabled(True)
-        self.clear_all_btn.setEnabled(True)
         self._update_queue_header()
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat(f"Batch completato: {success_count}/{total_count} video esportati")
@@ -1631,7 +1630,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.5")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v0.6")
         except Exception:
             pass
     app = QApplication(sys.argv)
