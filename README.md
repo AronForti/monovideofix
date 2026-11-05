@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="72" height="72" alt="MonoVideoFix Logo">
+  <img src="assets/icon.svg" width="96" height="96" alt="MonoVideoFix Logo">
 </p>
 
 <h1 align="center">MONOVIDEOFIX v1.6</h1>
@@ -7,6 +7,31 @@
   <strong>Seedance FPS & Judder Repair Tool</strong><br>
   Strumento desktop con interfaccia grafica (PyQt5) e CLI per l'analisi automatica e la correzione chirurgica di scattini (<em>judder</em>), frame persi e frame duplicati nei video (es. conversioni errate 25 → 24 fps).
 </p>
+
+
+---
+
+## 📸 Screenshot
+
+### Coda batch e analisi
+Trascina uno o più video: l'analisi parte da sola e riconosce la cadenza dei frame persi (qui *1 ogni 24*, tipica di una conversione 25 → 24 fps) e i frame duplicati.
+
+<p align="center"><img src="assets/screenshots/main-window.png" alt="Finestra principale con coda batch analizzata" width="900"></p>
+
+### Anteprima Prima / Dopo: frame mancante
+Il riquadro *Dopo* contiene il frame ricostruito con optical flow (cella verde nella timeline). Nell'*Originale* i frame scorrono senza buchi e la **lineetta rossa** indica dove mancava il fotogramma. Sotto la timeline: i totali reali del video, `ORIGINALE 232 → CORRETTO 240 frame`.
+
+<p align="center"><img src="assets/screenshots/preview-missing.png" alt="Anteprima su frame mancante" width="900"></p>
+
+### Anteprima Prima / Dopo: frame duplicato
+Il duplicato (cella rossa nell'*Originale*) viene rimosso dal video corretto; la lineetta rossa nella corsia *Corretto* segna il punto in cui è stato tolto.
+
+<p align="center"><img src="assets/screenshots/preview-duplicate.png" alt="Anteprima su frame duplicato" width="900"></p>
+
+### Heat-Map Movimento
+La mappa termica evidenzia quanto si muove ogni zona tra un frame e il successivo: un salto di movimento (frame mancante) risulta molto più "caldo" a sinistra che nel video corretto a destra.
+
+<p align="center"><img src="assets/screenshots/preview-heatmap.png" alt="Heat-Map Movimento" width="900"></p>
 
 ---
 
@@ -103,3 +128,4 @@ Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.6.exe`.
 | `requirements.txt` | Elenco delle dipendenze Python del progetto |
 | `LEGGIMI.txt` | Guida rapida per l'utente finale |
 | `monovideofix.ico` / `assets/icon.svg` | Icone dell'applicazione |
+| `assets/screenshots/` | Screenshot dell'interfaccia usati in questo README |
