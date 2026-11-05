@@ -28,7 +28,6 @@ import cv2
 import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush,
     QColor,
     QDragEnterEvent,
     QDropEvent,
@@ -1032,29 +1031,17 @@ class PreviewGenerationWorker(QThread):
                 - sum(1 for d in full_plan["drop_dup_set"] if d < s_frame)
             )
 
-            # Le due corsie restano allineate nel TEMPO: dove un fotogramma non esiste
-            # (mancante nel sorgente / rimosso nell'output) si usa uno slot vuoto (None),
-            # mai una copia o un frame inventato. Così i conteggi reali restano diversi.
-            orig_slots: list[np.ndarray | None] = []
+            # Ogni corsia contiene SOLO fotogrammi reali e scorre in modo continuo, esattamente come
+            # il video vero: nessun frame finto o grafica inserita nella riproduzione.
+            # Il punto in cui manca un frame (Originale) o in cui un duplicato è stato tolto (Corretto)
+            # viene segnato solo nella timeline con una lineetta rossa tra due celle.
+            orig_lane: list[np.ndarray] = []
             orig_status: list[str] = []
-            orig_numbers: list[int | None] = []
-            fixed_slots: list[np.ndarray | None] = []
+            orig_numbers: list[int] = []
+            orig_marks: list[int] = []   # indice della cella PRIMA della quale manca un frame
+            fixed_lane: list[np.ndarray] = []
             fixed_status: list[str] = []
-            fixed_numbers: list[int | None] = []
-            out_counter = 0
-
-            def push(o_frame, o_st, o_num, f_frame, f_st):
-                nonlocal out_counter
-                orig_slots.append(o_frame)
-                orig_status.append(o_st)
-                orig_numbers.append(o_num)
-                fixed_slots.append(f_frame)
-                fixed_status.append(f_st)
-                if f_frame is not None:
-                    fixed_numbers.append(out_offset + out_counter)
-                    out_counter += 1
-                else:
-                    fixed_numbers.append(None)
+            fixed_marks: list[int] = []  # indice della cella PRIMA della quale è stato rimosso un duplicato
 
             def interp8(a8: np.ndarray, b8: np.ndarray) -> np.ndarray:
                 mid16 = interpolate_midpoint_16bit(
@@ -1066,15 +1053,28 @@ class PreviewGenerationWorker(QThread):
 
             n_seg = len(orig_frames)
             last_written = orig_frames[0]
+            jump_after_missing = False
 
             for k in range(n_seg):
                 g_idx = s_frame + k
                 cur_f = orig_frames[k]
                 next_f = orig_frames[k + 1] if (k + 1 < n_seg) else None
 
+                # Corsia Originale: sempre il fotogramma sorgente reale
+                orig_lane.append(cur_f)
+                orig_numbers.append(g_idx)
+                if g_idx in drop_dup_set or g_idx in replace_dup_set:
+                    orig_status.append("duplicate")
+                elif jump_after_missing:
+                    orig_status.append("missing_jump")
+                else:
+                    orig_status.append("normal")
+                jump_after_missing = False
+
+                # Corsia Corretto: identica all'export reale
                 if g_idx in drop_dup_set:
-                    # Duplicato puro: l'export lo ELIMINA → nella corsia Corretto lo slot resta vuoto
-                    push(cur_f, "duplicate", g_idx, None, "removed_dup")
+                    # Duplicato puro: l'export lo ELIMINA → i frame successivi scorrono a sinistra
+                    fixed_marks.append(len(fixed_lane))
                 elif g_idx in replace_dup_set and next_f is not None:
                     # Frame ripetuto al posto di quello mancante: viene SOSTITUITO (conteggio invariato)
                     self.progress.emit(
@@ -1082,60 +1082,64 @@ class PreviewGenerationWorker(QThread):
                         f"Ricostruzione Optical Flow frame ripetuto #{g_idx}...",
                     )
                     mid8 = interp8(last_written, next_f)
-                    push(cur_f, "duplicate", g_idx, mid8, "reconstructed_dup")
+                    fixed_lane.append(mid8)
+                    fixed_status.append("reconstructed_dup")
                     last_written = mid8
                 else:
-                    push(cur_f, "normal", g_idx, cur_f, "normal")
+                    fixed_lane.append(cur_f)
+                    fixed_status.append("normal")
                     last_written = cur_f
 
                 if g_idx in missing_set and next_f is not None:
-                    # Frame mancante: nel sorgente NON esiste → slot vuoto; l'export ne INSERISCE uno interpolato
+                    # Frame mancante: nell'Originale si passa direttamente al successivo (salto),
+                    # nel Corretto viene INSERITO il frame interpolato
                     self.progress.emit(
                         20 + int(65 * k / max(n_seg, 1)),
-                        f"Ricostruzione Optical Flow frame mancante #{g_idx}→#{g_idx+1}...",
+                        f"Ricostruzione Optical Flow frame mancante #{g_idx}\u2192#{g_idx+1}...",
                     )
+                    orig_marks.append(len(orig_lane))
+                    jump_after_missing = True
                     mid8 = interp8(cur_f, next_f)
-                    push(None, "missing_gap", None, mid8, "reconstructed_missing")
+                    fixed_lane.append(mid8)
+                    fixed_status.append("reconstructed_missing")
                     last_written = mid8
+
+            fixed_numbers = list(range(out_offset, out_offset + len(fixed_lane)))
 
             self.progress.emit(90, "Calcolo curva del movimento frame-by-frame...")
 
-            def compute_deltas(slots: list[np.ndarray | None]) -> list[float | None]:
-                """Delta di movimento rispetto al fotogramma REALE precedente; None per gli slot vuoti."""
-                deltas: list[float | None] = []
-                prev = None
-                for fr in slots:
-                    if fr is None:
-                        deltas.append(None)
-                        continue
-                    if prev is None:
-                        deltas.append(0.0)
-                    else:
-                        deltas.append(float(np.mean(np.abs(fr.astype(np.float32) - prev.astype(np.float32)))))
-                    prev = fr
-                real_idx = [i for i, d in enumerate(deltas) if d is not None]
-                if len(real_idx) > 1:
-                    deltas[real_idx[0]] = deltas[real_idx[1]]
+            def compute_deltas(frames_list: list[np.ndarray]) -> list[float]:
+                if not frames_list:
+                    return []
+                deltas = [0.0]
+                for i in range(1, len(frames_list)):
+                    deltas.append(float(np.mean(np.abs(
+                        frames_list[i].astype(np.float32) - frames_list[i - 1].astype(np.float32)
+                    ))))
+                if len(deltas) > 1:
+                    deltas[0] = deltas[1]
                 return deltas
 
-            orig_deltas = compute_deltas(orig_slots)
-            fixed_deltas = compute_deltas(fixed_slots)
+            orig_deltas = compute_deltas(orig_lane)
+            fixed_deltas = compute_deltas(fixed_lane)
 
             self.progress.emit(100, "Anteprima pronta!")
             self.finished_preview.emit({
                 "start_frame": s_frame,
                 "fps": fps,
                 "target_fps": self.item.target_fps,
-                "orig_frames": orig_slots,
+                "orig_frames": orig_lane,
                 "orig_frame_numbers": orig_numbers,
                 "orig_deltas": orig_deltas,
                 "orig_status": orig_status,
-                "fixed_frames": fixed_slots,
+                "orig_marks": orig_marks,
+                "fixed_frames": fixed_lane,
                 "fixed_frame_numbers": fixed_numbers,
                 "fixed_deltas": fixed_deltas,
                 "fixed_status": fixed_status,
-                "orig_real_count": sum(1 for f in orig_slots if f is not None),
-                "fixed_real_count": sum(1 for f in fixed_slots if f is not None),
+                "fixed_marks": fixed_marks,
+                "orig_real_count": len(orig_lane),
+                "fixed_real_count": len(fixed_lane),
                 "video_source_count": full_plan["source_count"],
                 "video_output_count": full_plan["output_count"],
                 "focus_anomaly_frame": self.focus_anomaly_frame,
@@ -1165,6 +1169,8 @@ class MotionTimelineWidget(QWidget):
         self.fixed_deltas: list[float] = []
         self.fixed_status: list[str] = []
         self.orig_frame_numbers: list[int] = []
+        self.orig_marks: list[int] = []
+        self.fixed_marks: list[int] = []
         self.current_step: int = 0
         self.total_steps: int = 1
 
@@ -1174,13 +1180,17 @@ class MotionTimelineWidget(QWidget):
         orig_status: list[str],
         fixed_deltas: list[float],
         fixed_status: list[str],
-        orig_frame_numbers: list[int | None] | None = None,
+        orig_frame_numbers: list[int] | None = None,
+        orig_marks: list[int] | None = None,
+        fixed_marks: list[int] | None = None,
     ):
         self.orig_deltas = orig_deltas
         self.orig_status = orig_status
         self.fixed_deltas = fixed_deltas
         self.fixed_status = fixed_status
         self.orig_frame_numbers = orig_frame_numbers or []
+        self.orig_marks = list(orig_marks or [])
+        self.fixed_marks = list(fixed_marks or [])
         self.total_steps = max(len(orig_deltas), len(fixed_deltas), 1)
         self.current_step = 0
         self.update()
@@ -1206,23 +1216,17 @@ class MotionTimelineWidget(QWidget):
             self.frame_selected.emit(self._step_from_x(event.pos().x()))
 
     @staticmethod
-    def _draw_empty_slot(p: QPainter, cell: QRectF, color: QColor):
-        """Slot vuoto (fotogramma assente): tratteggio diagonale, bordo tratteggiato e una X centrale."""
-        inner = cell.adjusted(1.0, 1.0, -1.0, -1.0)
-        hatch = QColor(color)
-        hatch.setAlpha(90)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(hatch, Qt.BDiagPattern))
-        p.drawRoundedRect(inner, 2.5, 2.5)
-        border = QColor(color)
-        border.setAlpha(170)
-        p.setPen(QPen(border, 1.2, Qt.DashLine))
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(inner, 2.5, 2.5)
-        if cell.width() >= 12.0:
-            p.setPen(color)
-            p.setFont(QFont("Segoe UI", 9, QFont.ExtraBold))
-            p.drawText(cell, Qt.AlignCenter, "\u2715")
+    def _draw_gap_mark(p: QPainter, x: float, top: float, bottom: float):
+        """Lineetta rossa verticale tra due celle: qui manca un frame / qui è stato rimosso un duplicato."""
+        p.setPen(QPen(QColor("#FFFFFF"), 1.5))
+        p.setBrush(QColor("#DC2626"))
+        p.drawRoundedRect(QRectF(x - 2.5, top + 2.0, 5.0, bottom - top - 2.0), 2.0, 2.0)
+        tri = QPolygonF([
+            QPointF(x - 6.5, top - 4.0),
+            QPointF(x + 6.5, top - 4.0),
+            QPointF(x, top + 4.5),
+        ])
+        p.drawPolygon(tri)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1248,8 +1252,10 @@ class MotionTimelineWidget(QWidget):
         usable_w = max(10.0, w - left_pad - right_pad)
         n = max(len(self.orig_deltas), len(self.fixed_deltas), 1)
         slot_w = usable_w / n
+        n_o = len(self.orig_deltas)
+        n_f = len(self.fixed_deltas)
 
-        all_vals = [v for v in (self.orig_deltas + self.fixed_deltas) if v is not None] or [1.0]
+        all_vals = (self.orig_deltas or [1.0]) + (self.fixed_deltas or [1.0])
         max_val = max(float(np.percentile(all_vals, 96)) * 1.30, 1.0)
 
         tracks_top = header_h + 2.0
@@ -1275,30 +1281,33 @@ class MotionTimelineWidget(QWidget):
         p.drawText(
             QRectF(10, tracks_top + 2, left_pad - 14, mid_y - tracks_top - 4),
             Qt.AlignLeft | Qt.AlignVCenter,
-            "ORIGINALE\nRosso = Errore\n\u2715 = frame assente",
+            "ORIGINALE\nRosso = Errore\n| = frame mancante",
         )
         p.setPen(QColor("#16A34A"))
         p.drawText(
             QRectF(10, mid_y + 2, left_pad - 14, tracks_bottom - mid_y - 4),
             Qt.AlignLeft | Qt.AlignVCenter,
-            "CORRETTO\nVerde = Ricostruito\n\u2715 = frame rimosso",
+            "CORRETTO\nVerde = Ricostruito\n| = frame rimosso",
         )
 
         # Disegna ogni fotogramma come una cella contigua (gap di appena 1.5px tra fotogrammi adiacenti)
         gap = 1.5
+        inner_pad = 2.0
         for i in range(n):
             cell_x = left_pad + i * slot_w + gap * 0.5
             cell_w = max(4.0, slot_w - gap)
             is_cur = (i == self.current_step)
+            has_o = i < n_o
+            has_f = i < n_f
 
-            st_o = self.orig_status[i] if i < len(self.orig_status) else "normal"
-            st_f = self.fixed_status[i] if i < len(self.fixed_status) else "normal"
-            val_o = self.orig_deltas[i] if i < len(self.orig_deltas) else 0.0
-            val_f = self.fixed_deltas[i] if i < len(self.fixed_deltas) else 0.0
-            f_num = self.orig_frame_numbers[i] if i < len(self.orig_frame_numbers) else (i + 1)
-            is_err_col = st_o in ("duplicate", "missing_jump", "missing_gap") or st_f == "removed_dup"
+            st_o = self.orig_status[i] if has_o else "normal"
+            st_f = self.fixed_status[i] if has_f else "normal"
+            val_o = self.orig_deltas[i] if has_o else 0.0
+            val_f = self.fixed_deltas[i] if has_f else 0.0
+            f_num = self.orig_frame_numbers[i] if i < len(self.orig_frame_numbers) else None
+            is_err_col = st_o in ("duplicate", "missing_jump")
 
-            # 1. Cella Header con numero del fotogramma
+            # 1. Cella Header con numero del fotogramma sorgente
             hdr_rect = QRectF(cell_x, 5.0, cell_w, header_h - 3.0)
             p.setPen(Qt.NoPen)
             if is_cur:
@@ -1309,7 +1318,7 @@ class MotionTimelineWidget(QWidget):
                 p.setBrush(QColor("#F1F5F9"))
             p.drawRoundedRect(hdr_rect, 3.0, 3.0)
 
-            if cell_w >= 20.0:
+            if cell_w >= 20.0 and f_num is not None:
                 p.setFont(QFont("Segoe UI", 7, QFont.ExtraBold if is_cur else QFont.Bold))
                 if is_cur:
                     p.setPen(QColor("#FFFFFF"))
@@ -1317,12 +1326,14 @@ class MotionTimelineWidget(QWidget):
                     p.setPen(QColor("#DC2626"))
                 else:
                     p.setPen(QColor("#475569"))
-                p.drawText(hdr_rect, Qt.AlignCenter, "\u2715" if f_num is None else f"#{f_num}")
+                p.drawText(hdr_rect, Qt.AlignCenter, f"#{f_num}")
 
             # 2. Cella Corsia Superiore (ORIGINALE)
             orig_cell = QRectF(cell_x, tracks_top + 1.0, cell_w, (mid_y - tracks_top) - 2.0)
             p.setPen(Qt.NoPen)
-            if st_o in ("duplicate", "missing_jump"):
+            if not has_o:
+                p.setBrush(QColor("#EEF2F7"))
+            elif st_o in ("duplicate", "missing_jump"):
                 p.setBrush(QColor("#FEF2F2"))
             elif is_cur:
                 p.setBrush(QColor("#EFF6FF"))
@@ -1330,69 +1341,53 @@ class MotionTimelineWidget(QWidget):
                 p.setBrush(QColor("#F8FAFC"))
             p.drawRoundedRect(orig_cell, 3.0, 3.0)
 
-            # Riempimento movimento Originale dentro la cella (a tutta larghezza della cella!)
-            inner_pad = 2.0
-            max_bar_h_o = max(4.0, orig_cell.height() - 4.0)
-            orig_empty = st_o == "missing_gap" or val_o is None
-            if orig_empty:
-                # Slot vuoto: nel sorgente questo fotogramma NON esiste
-                self._draw_empty_slot(p, orig_cell, QColor("#EA580C"))
-                bar_h_o, bar_col_o = 0.0, QColor("#EA580C")
-            elif st_o == "duplicate":
-                bar_h_o = max_bar_h_o
-                bar_col_o = QColor("#DC2626")
-            elif st_o == "missing_jump":
-                bar_h_o = max_bar_h_o
-                bar_col_o = QColor("#EA580C")
-            else:
+            if has_o:
+                max_bar_h_o = max(4.0, orig_cell.height() - 4.0)
                 bar_h_o = max(4.0, min(1.0, val_o / max_val) * max_bar_h_o)
-                bar_col_o = QColor("#64748B") if is_cur else QColor("#94A3B8")
-
-            if not orig_empty:
-                bar_rect_o = QRectF(
+                if st_o == "duplicate":
+                    bar_h_o = max_bar_h_o
+                    bar_col_o = QColor("#DC2626")
+                elif st_o == "missing_jump":
+                    # Altezza reale: si vede il salto di movimento (~2x) dovuto al frame mancante
+                    bar_col_o = QColor("#EA580C")
+                else:
+                    bar_col_o = QColor("#64748B") if is_cur else QColor("#94A3B8")
+                p.setBrush(bar_col_o)
+                p.drawRoundedRect(QRectF(
                     orig_cell.left() + inner_pad,
                     orig_cell.bottom() - 2.0 - bar_h_o,
                     max(2.0, orig_cell.width() - inner_pad * 2.0),
                     bar_h_o,
-                )
-                p.setPen(Qt.NoPen)
-                p.setBrush(bar_col_o)
-                p.drawRoundedRect(bar_rect_o, 2.5, 2.5)
+                ), 2.5, 2.5)
 
             # 3. Cella Corsia Inferiore (CORRETTO)
             fixed_cell = QRectF(cell_x, mid_y + 1.0, cell_w, (tracks_bottom - mid_y) - 2.0)
             p.setPen(Qt.NoPen)
-            if st_f in ("reconstructed_missing", "reconstructed_dup"):
+            if not has_f:
+                p.setBrush(QColor("#EEF2F7"))
+            elif st_f in ("reconstructed_missing", "reconstructed_dup"):
                 p.setBrush(QColor("#F0FDF4"))
-            elif st_f == "removed_dup":
-                p.setBrush(QColor("#FEF2F2"))
             elif is_cur:
                 p.setBrush(QColor("#EFF6FF"))
             else:
                 p.setBrush(QColor("#F8FAFC"))
             p.drawRoundedRect(fixed_cell, 3.0, 3.0)
 
-            if st_f == "removed_dup" or val_f is None:
-                # Slot vuoto: il duplicato viene eliminato dal video esportato
-                self._draw_empty_slot(p, fixed_cell, QColor("#DC2626"))
-                continue
-
-            max_bar_h_f = max(4.0, fixed_cell.height() - 4.0)
-            bar_h_f = max(4.0, min(1.0, val_f / max_val) * max_bar_h_f)
-            if st_f in ("reconstructed_missing", "reconstructed_dup"):
-                bar_col_f = QColor("#16A34A")
-                bar_h_f = max(bar_h_f, max_bar_h_f * 0.65)
-            else:
-                bar_col_f = QColor("#0047FF") if is_cur else QColor("#3B82F6")
-
-            bar_rect_f = QRectF(
-                fixed_cell.left() + inner_pad,
-                fixed_cell.bottom() - 2.0 - bar_h_f,
-                max(2.0, fixed_cell.width() - inner_pad * 2.0),
-                bar_h_f,
-            )
-            p.setBrush(bar_col_f)
-            p.drawRoundedRect(bar_rect_f, 2.5, 2.5)
+            if has_f:
+                max_bar_h_f = max(4.0, fixed_cell.height() - 4.0)
+                bar_h_f = max(4.0, min(1.0, val_f / max_val) * max_bar_h_f)
+                if st_f in ("reconstructed_missing", "reconstructed_dup"):
+                    bar_col_f = QColor("#16A34A")
+                    bar_h_f = max(bar_h_f, max_bar_h_f * 0.65)
+                else:
+                    bar_col_f = QColor("#0047FF") if is_cur else QColor("#3B82F6")
+                p.setBrush(bar_col_f)
+                p.drawRoundedRect(QRectF(
+                    fixed_cell.left() + inner_pad,
+                    fixed_cell.bottom() - 2.0 - bar_h_f,
+                    max(2.0, fixed_cell.width() - inner_pad * 2.0),
+                    bar_h_f,
+                ), 2.5, 2.5)
 
         # 4. Riquadro di selezione del Frame Corrente perfettamente sovrapposto alla cella attiva
         if 0 <= self.current_step < n:
@@ -1402,6 +1397,12 @@ class MotionTimelineWidget(QWidget):
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor("#0047FF"), 2.4))
             p.drawRoundedRect(sel_rect, 4.0, 4.0)
+
+        # 5. Lineette rosse (sopra la selezione, così restano sempre visibili) nei punti in cui manca un frame (Originale) o è stato rimosso un duplicato (Corretto)
+        for b in self.orig_marks:
+            self._draw_gap_mark(p, left_pad + b * slot_w, tracks_top + 1.0, mid_y - 1.0)
+        for b in self.fixed_marks:
+            self._draw_gap_mark(p, left_pad + b * slot_w, mid_y + 1.0, tracks_bottom - 1.0)
 
         p.end()
 
@@ -2096,8 +2097,9 @@ class PreviewComparisonDialog(QDialog):
         self.counts_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.counts_lbl.setToolTip(
             "Conteggi reali del video esportato.\n"
-            "Le due corsie restano allineate nel tempo: dove un fotogramma non esiste\n"
-            "(mancante nel sorgente o rimosso nell'output) compare uno slot vuoto \u2715."
+            "Ogni corsia riproduce solo i propri fotogrammi reali, senza interruzioni.\n"
+            "La lineetta rossa nella timeline indica dove manca un frame (Originale)\n"
+            "o dove un duplicato è stato rimosso (Corretto)."
         )
         tl_lay.addWidget(self.counts_lbl)
         root.addWidget(timeline_card)
@@ -2287,6 +2289,8 @@ class PreviewComparisonDialog(QDialog):
             data["fixed_deltas"],
             data["fixed_status"],
             data.get("orig_frame_numbers"),
+            data.get("orig_marks"),
+            data.get("fixed_marks"),
         )
         self.counts_lbl.setText(self._video_counts_text())
         self.play_btn.setEnabled(True)
@@ -2413,15 +2417,6 @@ class PreviewComparisonDialog(QDialog):
                     "background-color: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; "
                     "font-size: 10px; font-weight: 800; border-radius: 4px;"
                 )
-            elif st_o == "missing_gap":
-                self.orig_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #F59E0B; border-radius: 10px; }"
-                )
-                self.orig_badge.setText("\u2715 Frame Mancante")
-                self.orig_badge.setStyleSheet(
-                    "background-color: #FFFBEB; color: #B45309; border: 1px solid #FDE68A; "
-                    "font-size: 10px; font-weight: 700; border-radius: 4px;"
-                )
             elif st_o == "missing_jump":
                 self.orig_panel.setStyleSheet(
                     "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #F59E0B; border-radius: 10px; }"
@@ -2452,15 +2447,6 @@ class PreviewComparisonDialog(QDialog):
                     "background-color: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; "
                     "font-size: 10px; font-weight: 700; border-radius: 4px;"
                 )
-            elif st_f == "removed_dup":
-                self.fixed_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #EF4444; border-radius: 10px; }"
-                )
-                self.fixed_badge.setText("\u2715 Duplicato Rimosso")
-                self.fixed_badge.setStyleSheet(
-                    "background-color: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; "
-                    "font-size: 10px; font-weight: 800; border-radius: 4px;"
-                )
             else:
                 self.fixed_panel.setStyleSheet(
                     "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #E2E8F0; border-radius: 10px; }"
@@ -2470,53 +2456,6 @@ class PreviewComparisonDialog(QDialog):
                     "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
                     "font-size: 10px; font-weight: 600; border-radius: 4px;"
                 )
-
-    @staticmethod
-    def _nearest_real_frame(frames: list, idx: int, backward_only: bool = False):
-        """Restituisce il fotogramma reale (non None) più vicino prima di `idx` (o dopo, se non esiste)."""
-        for j in range(idx - 1, -1, -1):
-            if frames[j] is not None:
-                return frames[j]
-        if backward_only:
-            return None
-        for j in range(idx + 1, len(frames)):
-            if frames[j] is not None:
-                return frames[j]
-        return None
-
-    @staticmethod
-    def _make_gap_visual(base_frame: np.ndarray | None, title: str, subtitle: str, color_rgb: tuple) -> np.ndarray:
-        """
-        Visualizza uno slot VUOTO: il fotogramma in questo istante non esiste (mancante nel sorgente
-        oppure rimosso dall'output). Mostra l'ultimo frame reale molto scurito con un tratteggio
-        diagonale e un'etichetta, così non può essere scambiato per un fotogramma vero.
-        """
-        if base_frame is None:
-            out = np.full((360, 640, 3), 24, dtype=np.uint8)
-        else:
-            gray = cv2.cvtColor(base_frame, cv2.COLOR_RGB2GRAY)
-            dark = (gray.astype(np.float32) * 0.28).astype(np.uint8)
-            out = np.stack([dark, dark, dark], axis=-1)
-        h, w, _ = out.shape
-        stripe_col = tuple(int(c * 0.45) for c in color_rgb)
-        step = max(18, w // 28)
-        for x0 in range(-h, w, step):
-            cv2.line(out, (x0, h), (x0 + h, 0), stripe_col, 2, cv2.LINE_AA)
-        cv2.rectangle(out, (2, 2), (w - 3, h - 3), color_rgb, 3)
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale_t = max(0.6, min(1.3, w / 900.0))
-        scale_s = scale_t * 0.55
-        (tw, th), _ = cv2.getTextSize(title, font, scale_t, 2)
-        (sw, sh), _ = cv2.getTextSize(subtitle, font, scale_s, 1)
-        box_w = max(tw, sw) + 40
-        box_h = th + sh + 44
-        bx0 = max(0, (w - box_w) // 2)
-        by0 = max(0, (h - box_h) // 2)
-        cv2.rectangle(out, (bx0, by0), (bx0 + box_w, by0 + box_h), color_rgb, -1)
-        cv2.putText(out, title, ((w - tw) // 2, by0 + 16 + th), font, scale_t, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(out, subtitle, ((w - sw) // 2, by0 + 28 + th + sh), font, scale_s, (255, 255, 255), 1, cv2.LINE_AA)
-        return out
 
     def _video_counts_text(self) -> str:
         plan = build_correction_plan(self.analysis)
@@ -2547,63 +2486,35 @@ class PreviewComparisonDialog(QDialog):
         src_total = self.preview_data.get("video_source_count", 0)
         out_total = self.preview_data.get("video_output_count", 0)
 
+        # La corsia più corta resta sull'ultimo fotogramma finché l'altra non termina il ciclo
         idx_o = min(self.current_step, len(orig_frames) - 1)
         idx_f = min(self.current_step, len(fixed_frames) - 1)
 
         st_o = orig_status[idx_o]
         st_f = fixed_status[idx_f]
-        fr_o = orig_frames[idx_o]
-        fr_f = fixed_frames[idx_f]
 
-        if fr_o is None:
-            disp_o = self._make_gap_visual(
-                self._nearest_real_frame(orig_frames, idx_o),
-                "FRAME MANCANTE",
-                "questo fotogramma non esiste nel video originale",
-                (234, 88, 12),
-            )
-        elif self.diff_mode:
-            prev_o = self._nearest_real_frame(orig_frames, idx_o, backward_only=True)
-            disp_o = self._make_diff_visual(fr_o, prev_o if prev_o is not None else fr_o, st_o, orig_deltas[idx_o] or 0.0)
+        if self.diff_mode:
+            prev_o = orig_frames[max(0, idx_o - 1)]
+            prev_f = fixed_frames[max(0, idx_f - 1)]
+            disp_o = self._make_diff_visual(orig_frames[idx_o], prev_o, st_o, orig_deltas[idx_o])
+            disp_f = self._make_diff_visual(fixed_frames[idx_f], prev_f, st_f, fixed_deltas[idx_f])
         else:
-            disp_o = fr_o
-
-        if fr_f is None:
-            disp_f = self._make_gap_visual(
-                self._nearest_real_frame(fixed_frames, idx_f),
-                "FRAME RIMOSSO",
-                "duplicato eliminato dal video esportato",
-                (220, 38, 38),
-            )
-        elif self.diff_mode:
-            prev_f = self._nearest_real_frame(fixed_frames, idx_f, backward_only=True)
-            disp_f = self._make_diff_visual(fr_f, prev_f if prev_f is not None else fr_f, st_f, fixed_deltas[idx_f] or 0.0)
-        else:
-            disp_f = fr_f
+            disp_o = orig_frames[idx_o]
+            disp_f = fixed_frames[idx_f]
 
         self.orig_img_lbl.set_frame_array(disp_o)
         self.fixed_img_lbl.set_frame_array(disp_f)
 
         self._update_panel_indicators(st_o, st_f)
 
-        if fr_o is None:
-            self.orig_meta_lbl.setText(
-                "Frame assente nel sorgente (mancante)"
-            )
-        else:
-            f_num_orig = orig_frame_nums[idx_o] if idx_o < len(orig_frame_nums) else idx_o
-            self.orig_meta_lbl.setText(
-                f"Frame sorgente #{f_num_orig} (su {src_total})  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
-            )
-        if fr_f is None:
-            self.fixed_meta_lbl.setText(
-                "Frame rimosso dall'output (duplicato)"
-            )
-        else:
-            f_num_out = fixed_frame_nums[idx_f] if idx_f < len(fixed_frame_nums) else idx_f
-            self.fixed_meta_lbl.setText(
-                f"Frame output #{f_num_out} (su {out_total})  \u2022  Delta movimento: {fixed_deltas[idx_f]:.2f}"
-            )
+        f_num_orig = orig_frame_nums[idx_o] if idx_o < len(orig_frame_nums) else idx_o
+        self.orig_meta_lbl.setText(
+            f"Frame sorgente #{f_num_orig} (su {src_total})  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
+        )
+        f_num_out = fixed_frame_nums[idx_f] if idx_f < len(fixed_frame_nums) else idx_f
+        self.fixed_meta_lbl.setText(
+            f"Frame output #{f_num_out} (su {out_total})  \u2022  Delta movimento: {fixed_deltas[idx_f]:.2f}"
+        )
         self.timeline.set_step(self.current_step)
 
     def closeEvent(self, event):
@@ -2617,11 +2528,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.4 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.5 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.4")
+        self.setWindowTitle("MONOVIDEOFIX v1.5")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -3393,7 +3304,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.4")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.5")
         except Exception:
             pass
     app = QApplication(sys.argv)
