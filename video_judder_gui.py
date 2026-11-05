@@ -1750,10 +1750,10 @@ class PreviewComparisonDialog(QDialog):
     Finestra di Anteprima Confronto Prima / Dopo (Opzione 1 con strumenti diagnostici):
     1. Rallentatore 'Microscopio' (0.25x / 0.5x / 1x) + Navigazione frame tramite frecce Sinistra/Destra.
     2. Galleria di Thumbnail cliccabili per ciascun momento in cui avviene un frame duplicato o mancante.
-    3. Semaforo statico a zero jitter su Bordo & Badge (dimensioni fisse, nessun ricalcolo layout).
+    3. Riquadri video con bordo neutro fisso: nessun badge o colore che cambi durante il playback.
     4. Timeline 'Elettrocardiogramma' (Grafico del Movimento Frame-by-Frame cliccabile).
     5. Modalità 'Heat-Map Movimento' ad alta chiarezza (sovrapposizione termica dei pixel in movimento sul video desaturato).
-    6. Zoom e Pan sincronizzati in tempo reale tra il frame Originale e il frame Corretto.
+    6. Zoom (rotellina) e Pan (trascinamento) sincronizzati tra il frame Originale e il frame Corretto.
     """
 
     def __init__(self, parent: QWidget, item: BatchVideoItem):
@@ -1773,8 +1773,6 @@ class PreviewComparisonDialog(QDialog):
         self.diff_mode: bool = False
         self.worker: PreviewGenerationWorker | None = None
         self.thumb_worker: AnomalyThumbnailsWorker | None = None
-        self._last_orig_state: str = ""
-        self._last_fixed_state: str = ""
         self._focus_anomaly_frame: int | None = None
 
         missing_set = set(self.analysis.get("missing_indices", []))
@@ -1921,14 +1919,11 @@ class PreviewComparisonDialog(QDialog):
             f"VERIFICA VISIVA MICRO-SCATTI: {Path(self.item.path).name}  \u2022  Target: {self.item.target_fps} FPS"
         )
         self.header_lbl.setStyleSheet("font-size: 13px; font-weight: 900; color: #FFFFFF;")
-        zoom_hint_lbl = QLabel("🔍 Rotellina: Zoom sincronizzato  •  Trascina: Sposta vista  •  Doppio click: Reset 100%")
-        zoom_hint_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #E2EBFF;")
         top_bar.addWidget(self.header_lbl)
         top_bar.addStretch()
-        top_bar.addWidget(zoom_hint_lbl)
         root.addLayout(top_bar)
 
-        # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca con Badge compatti a larghezza/altezza fissa (zero scatti UI)
+        # Riquadri Video Affiancati (Prima / Dopo) su superficie Bianca, con bordo neutro fisso (nessun cambio di stato durante il playback)
         videos_row = QHBoxLayout()
         videos_row.setSpacing(14)
 
@@ -1944,24 +1939,11 @@ class PreviewComparisonDialog(QDialog):
         orig_title = QLabel("PRIMA — VIDEO ORIGINALE")
         orig_title.setFixedHeight(22)
         orig_title.setStyleSheet("color: #0F172A; font-size: 11px; font-weight: 900;")
-        self.orig_badge = QLabel("In caricamento...")
-        self.orig_badge.setFixedSize(195, 22)
-        self.orig_badge.setAlignment(Qt.AlignCenter)
-        self.orig_badge.setStyleSheet(
-            "background-color: #F1F5F9; color: #64748B; border: 1px solid #CBD5E1; "
-            "font-size: 10px; font-weight: 700; border-radius: 4px;"
-        )
         orig_top.addWidget(orig_title)
         orig_top.addStretch()
-        orig_top.addWidget(self.orig_badge)
         orig_lay.addLayout(orig_top)
 
         self.orig_img_lbl = SyncZoomVideoView()
-        self.orig_img_lbl.setToolTip(
-            "Rotellina del mouse: Zoom avanti/indietro sincronizzato\n"
-            "Click sinistro + trascina: Sposta l'inquadratura su entrambi i frame\n"
-            "Doppio click (o tasto destro): Reset vista al 100%"
-        )
         orig_lay.addWidget(self.orig_img_lbl, stretch=1)
 
         self.orig_meta_lbl = QLabel("Frame: —")
@@ -1982,24 +1964,11 @@ class PreviewComparisonDialog(QDialog):
         fixed_title = QLabel("DOPO — VIDEO CORRETTO (OPTICAL FLOW)")
         fixed_title.setFixedHeight(22)
         fixed_title.setStyleSheet("color: #0047FF; font-size: 11px; font-weight: 900;")
-        self.fixed_badge = QLabel("In caricamento...")
-        self.fixed_badge.setFixedSize(195, 22)
-        self.fixed_badge.setAlignment(Qt.AlignCenter)
-        self.fixed_badge.setStyleSheet(
-            "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
-            "font-size: 10px; font-weight: 700; border-radius: 4px;"
-        )
         fixed_top.addWidget(fixed_title)
         fixed_top.addStretch()
-        fixed_top.addWidget(self.fixed_badge)
         fixed_lay.addLayout(fixed_top)
 
         self.fixed_img_lbl = SyncZoomVideoView()
-        self.fixed_img_lbl.setToolTip(
-            "Rotellina del mouse: Zoom avanti/indietro sincronizzato\n"
-            "Click sinistro + trascina: Sposta l'inquadratura su entrambi i frame\n"
-            "Doppio click (o tasto destro): Reset vista al 100%"
-        )
         fixed_lay.addWidget(self.fixed_img_lbl, stretch=1)
 
         # Sincronizzazione bidirezionale di Zoom e Movimento tra PRIMA e DOPO
@@ -2141,35 +2110,6 @@ class PreviewComparisonDialog(QDialog):
             ctrl_lay.addWidget(s_btn)
         self.speed_group.buttonClicked.connect(self._on_speed_changed)
 
-        ctrl_lay.addSpacing(12)
-        zoom_lbl = QLabel("Zoom:")
-        zoom_lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #FFFFFF;")
-        ctrl_lay.addWidget(zoom_lbl)
-
-        self.zoom_out_btn = QPushButton("−")
-        self.zoom_out_btn.setObjectName("CtrlBtn")
-        self.zoom_out_btn.setCursor(Qt.PointingHandCursor)
-        self.zoom_out_btn.setFocusPolicy(Qt.NoFocus)
-        self.zoom_out_btn.setToolTip("Riduci zoom su entrambi i frame")
-        self.zoom_out_btn.clicked.connect(lambda: self.orig_img_lbl.step_zoom(1.0 / 1.35, emit_signal=True))
-        ctrl_lay.addWidget(self.zoom_out_btn)
-
-        self.zoom_reset_btn = QPushButton("100%")
-        self.zoom_reset_btn.setObjectName("CtrlBtn")
-        self.zoom_reset_btn.setCursor(Qt.PointingHandCursor)
-        self.zoom_reset_btn.setFocusPolicy(Qt.NoFocus)
-        self.zoom_reset_btn.setToolTip("Ripristina zoom al 100% (1.0x) su entrambi i frame")
-        self.zoom_reset_btn.clicked.connect(lambda: self.orig_img_lbl.reset_zoom(emit_signal=True))
-        ctrl_lay.addWidget(self.zoom_reset_btn)
-
-        self.zoom_in_btn = QPushButton("+")
-        self.zoom_in_btn.setObjectName("CtrlBtn")
-        self.zoom_in_btn.setCursor(Qt.PointingHandCursor)
-        self.zoom_in_btn.setFocusPolicy(Qt.NoFocus)
-        self.zoom_in_btn.setToolTip("Ingrandisci su entrambi i frame (oppure usa la rotellina del mouse)")
-        self.zoom_in_btn.clicked.connect(lambda: self.orig_img_lbl.step_zoom(1.35, emit_signal=True))
-        ctrl_lay.addWidget(self.zoom_in_btn)
-
         ctrl_lay.addStretch()
 
         self.diff_btn = QPushButton("\U0001f525 Heat-Map Movimento")
@@ -2189,11 +2129,9 @@ class PreviewComparisonDialog(QDialog):
 
     def _on_orig_view_changed(self, zoom: float, center_u: float, center_v: float):
         self.fixed_img_lbl.set_view_state(zoom, center_u, center_v, emit_signal=False)
-        self.zoom_reset_btn.setText(f"{int(round(zoom * 100))}%")
 
     def _on_fixed_view_changed(self, zoom: float, center_u: float, center_v: float):
         self.orig_img_lbl.set_view_state(zoom, center_u, center_v, emit_signal=False)
-        self.zoom_reset_btn.setText(f"{int(round(zoom * 100))}%")
 
     def _start_thumbnails_worker(self):
         if not self.anomaly_frames:
@@ -2235,8 +2173,6 @@ class PreviewComparisonDialog(QDialog):
             self.worker.wait()
 
         s_frame, num_f, focus_f, focus_t = self._compute_segment_for_anomaly(self.current_anomaly_pos)
-        self._last_orig_state = ""
-        self._last_fixed_state = ""
         self.orig_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.fixed_img_lbl.setText("Generazione anteprima Optical Flow in corso...")
         self.play_btn.setEnabled(False)
@@ -2400,63 +2336,6 @@ class PreviewComparisonDialog(QDialog):
 
         return out
 
-    def _update_panel_indicators(self, st_o: str, st_f: str):
-        """
-        Aggiorna testo e colori dei badge/bordi SOLO quando lo stato cambia e mantenendo
-        spessori di bordo (2px pannello, 1px badge) e dimensioni (195x22) rigorosamente identici
-        in ogni stato, eliminando qualsiasi micro-scatto o ricalcolo della UI.
-        """
-        if st_o != self._last_orig_state:
-            self._last_orig_state = st_o
-            if st_o == "duplicate":
-                self.orig_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #EF4444; border-radius: 10px; }"
-                )
-                self.orig_badge.setText("\u25cf Frame Duplicato (Blocco)")
-                self.orig_badge.setStyleSheet(
-                    "background-color: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; "
-                    "font-size: 10px; font-weight: 800; border-radius: 4px;"
-                )
-            elif st_o == "missing_jump":
-                self.orig_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #F59E0B; border-radius: 10px; }"
-                )
-                self.orig_badge.setText("\u25cf Salto Frame Mancante")
-                self.orig_badge.setStyleSheet(
-                    "background-color: #FFFBEB; color: #B45309; border: 1px solid #FDE68A; "
-                    "font-size: 10px; font-weight: 700; border-radius: 4px;"
-                )
-            else:
-                self.orig_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #E2E8F0; border-radius: 10px; }"
-                )
-                self.orig_badge.setText("Sorgente Originale")
-                self.orig_badge.setStyleSheet(
-                    "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
-                    "font-size: 10px; font-weight: 600; border-radius: 4px;"
-                )
-
-        if st_f != self._last_fixed_state:
-            self._last_fixed_state = st_f
-            if st_f in ("reconstructed_missing", "reconstructed_dup"):
-                self.fixed_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #3B82F6; border-radius: 10px; }"
-                )
-                self.fixed_badge.setText("\u2726 Ricostruito Optical Flow")
-                self.fixed_badge.setStyleSheet(
-                    "background-color: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; "
-                    "font-size: 10px; font-weight: 700; border-radius: 4px;"
-                )
-            else:
-                self.fixed_panel.setStyleSheet(
-                    "QFrame#VideoPanel { background-color: #FFFFFF; border: 2px solid #E2E8F0; border-radius: 10px; }"
-                )
-                self.fixed_badge.setText("Flusso Continuo")
-                self.fixed_badge.setStyleSheet(
-                    "background-color: #F8FAFC; color: #64748B; border: 1px solid #E2E8F0; "
-                    "font-size: 10px; font-weight: 600; border-radius: 4px;"
-                )
-
     def _video_counts_text(self) -> str:
         plan = build_correction_plan(self.analysis)
         text = (
@@ -2505,8 +2384,6 @@ class PreviewComparisonDialog(QDialog):
         self.orig_img_lbl.set_frame_array(disp_o)
         self.fixed_img_lbl.set_frame_array(disp_f)
 
-        self._update_panel_indicators(st_o, st_f)
-
         f_num_orig = orig_frame_nums[idx_o] if idx_o < len(orig_frame_nums) else idx_o
         self.orig_meta_lbl.setText(
             f"Frame sorgente #{f_num_orig} (su {src_total})  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
@@ -2528,11 +2405,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.5 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.6 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.5")
+        self.setWindowTitle("MONOVIDEOFIX v1.6")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -3304,7 +3181,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.5")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.6")
         except Exception:
             pass
     app = QApplication(sys.argv)
