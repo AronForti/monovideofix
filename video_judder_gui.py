@@ -196,9 +196,23 @@ def probe_video(video_path: str) -> dict:
 
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
 
+    def _rate(txt: str | None) -> float:
+        try:
+            num, den = map(int, (txt or "0/0").split("/"))
+            return num / den if den else 0.0
+        except ValueError:
+            return 0.0
+
     r_fps = v_stream.get("r_frame_rate", "24/1")
-    num, den = map(int, r_fps.split("/"))
-    fps = num / den if den else 24.0
+    avg_fps_str = v_stream.get("avg_frame_rate") or ""
+    r_rate = _rate(r_fps)
+    avg_rate = _rate(avg_fps_str)
+    # r_frame_rate è il "passo minimo" dei timestamp, non la frequenza reale dei fotogrammi:
+    # nei file a framerate variabile (es. durate alternate 50/33 ms → r=60, media=24)
+    # usarlo farebbe leggere ogni frame 2-3 volte. Si usa la media reale quando differiscono.
+    is_vfr = avg_rate > 0 and r_rate > 0 and abs(r_rate - avg_rate) / avg_rate > 0.01
+    fps = avg_rate if avg_rate > 0 and (is_vfr or r_rate <= 0) else (r_rate or 24.0)
+    fps_str = avg_fps_str if is_vfr else r_fps
 
     duration = float(
         v_stream.get("duration")
@@ -223,7 +237,9 @@ def probe_video(video_path: str) -> dict:
         "width": int(v_stream["width"]),
         "height": int(v_stream["height"]),
         "fps": fps,
-        "fps_str": r_fps,
+        "fps_str": fps_str,
+        "r_frame_rate": r_rate,
+        "is_vfr": is_vfr,
         "closest_fps": closest_fps,
         "nb_frames": nb_frames,
         "duration": duration,
@@ -235,6 +251,66 @@ def probe_video(video_path: str) -> dict:
         "color_primaries": v_stream.get("color_primaries") or "bt709",
         "color_range": v_stream.get("color_range") or "tv",
         "has_audio": has_audio,
+    }
+
+
+def probe_frame_times(video_path: str) -> list[float]:
+    """
+    Istante di presentazione (s) di ogni fotogramma reale, relativo all'inizio del file
+    (lo stesso riferimento usato da `ffmpeg -ss`). Legge solo i pacchetti, senza decodificare.
+    """
+    cmd = [
+        get_ffmpeg_bin("ffprobe"),
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time:format=start_time",
+        "-of", "json",
+        str(video_path),
+    ]
+    data = json.loads(subprocess.check_output(cmd, text=True, **get_subprocess_kwargs()))
+    try:
+        start = float(data.get("format", {}).get("start_time") or 0.0)
+    except ValueError:
+        start = 0.0
+    times = []
+    for pkt in data.get("packets", []):
+        try:
+            times.append(float(pkt["pts_time"]) - start)
+        except (KeyError, ValueError):
+            continue
+    return sorted(times)
+
+
+def frame_time(meta: dict, analysis: dict | None, idx: int) -> float:
+    """Istante (s) del frame sorgente `idx`: timestamp reale se noto, altrimenti idx / fps."""
+    times = (analysis or {}).get("frame_times") or []
+    if 0 <= idx < len(times):
+        return times[idx]
+    return idx / (meta.get("fps") or 24.0)
+
+
+def seek_time(meta: dict, analysis: dict | None, idx: int) -> float:
+    """Valore per `-ss` che fa partire la decodifica esattamente dal frame `idx`."""
+    return max(0.0, frame_time(meta, analysis, idx) - 0.001) if idx > 0 else 0.0
+
+
+def summarize_frame_timing(frame_times: list[float]) -> dict | None:
+    """Riassume le durate dei frame: rileva timestamp irregolari (es. alternanza 50/33 ms)."""
+    if len(frame_times) < 3:
+        return None
+    durs = np.round(np.diff(np.asarray(frame_times, dtype=np.float64)) * 1000.0, 1)
+    durs = durs[durs > 0]
+    if len(durs) == 0:
+        return None
+    vals, counts = np.unique(durs, return_counts=True)
+    order = np.argsort(-counts)
+    top = [(float(vals[i]), int(counts[i])) for i in order[:3]]
+    med = float(np.median(durs))
+    irregular = sum(c for v, c in zip(vals, counts) if abs(v - med) > max(1.5, 0.08 * med))
+    return {
+        "durations_ms": top,
+        "irregular_count": int(irregular),
+        "irregular_share": float(irregular / len(durs)),
     }
 
 
@@ -250,8 +326,21 @@ def build_report_text(meta: dict, analysis: dict) -> str:
         f"Sorgente   : {meta['width']}x{meta['height']} @ {meta['fps']:.3f} fps | "
         f"Codec: {meta['codec_raw']} ({meta['pix_fmt']}) | Frame: {analysis['num_frames']}",
     ]
+    timing = analysis.get("frame_timing")
+    if meta.get("is_vfr") or (timing and timing["irregular_share"] > 0.05):
+        durs = ", ".join(f"{d:g} ms ×{c}" for d, c in (timing or {}).get("durations_ms", []))
+        lines.append(
+            f"[!] TIMESTAMP IRREGOLARI (framerate variabile): passo dichiarato {meta.get('r_frame_rate', 0):g} fps, "
+            f"media reale {meta['fps']:.3f} fps"
+        )
+        if durs:
+            lines.append(f"    Durata dei frame: {durs}")
+        lines.append(
+            "    In riproduzione i frame restano a schermo per tempi diversi → judder anche senza frame persi.\n"
+            f"    L'export a FPS costanti riallinea ogni frame a intervalli identici (1 frame = 1/{meta['closest_fps']} s)."
+        )
     if cuts:
-        cuts_str = ", ".join(f"{c}→{c+1} ({(c+1)/meta['fps']:.2f}s)" for c in cuts)
+        cuts_str = ", ".join(f"{c}→{c+1} ({frame_time(meta, analysis, c + 1):.2f}s)" for c in cuts)
         lines.append(f"Cambi scena: {cuts_str}")
     lines.append("-" * 68)
 
@@ -266,7 +355,7 @@ def build_report_text(meta: dict, analysis: dict) -> str:
 
         ratios = analysis["ratios"]
         for idx in missing:
-            t_sec = (idx + 1) / meta["fps"]
+            t_sec = frame_time(meta, analysis, idx + 1)
             lines.append(
                 f"    • Transizione frame #{idx:3d} → #{idx+1:3d}  (t = {t_sec:5.2f}s)  |  "
                 f"Salto movimento: {ratios[idx]:.2f}x rispetto ai frame adiacenti"
@@ -278,7 +367,7 @@ def build_report_text(meta: dict, analysis: dict) -> str:
         lines.append("-" * 68)
         lines.append(f"[!] Rilevati {len(duplicates)} frame duplicati / congelati:")
         for idx in duplicates:
-            t_sec = (idx + 1) / meta["fps"]
+            t_sec = frame_time(meta, analysis, idx + 1)
             lines.append(f"    • Frame duplicato #{idx:3d} → #{idx+1:3d}  (t = {t_sec:5.2f}s)")
     else:
         lines.append("[✓] Nessun frame duplicato rilevato.")
@@ -416,6 +505,7 @@ class BatchAnalysisWorker(QThread):
             get_ffmpeg_bin("ffmpeg"),
             "-v", "error",
             "-i", video_path,
+            "-fps_mode", "passthrough",
             "-vf", f"scale={W}:{H}",
             "-pix_fmt", "gray",
             "-f", "rawvideo",
@@ -437,6 +527,13 @@ class BatchAnalysisWorker(QThread):
         n = len(frames)
         if n < 3:
             raise ValueError("Troppi pochi fotogrammi per l'analisi.")
+
+        try:
+            frame_times = probe_frame_times(video_path)
+        except Exception:
+            frame_times = []
+        if len(frame_times) != n:
+            frame_times = []
 
         mad_scores = []
         p90_disp = []
@@ -470,7 +567,16 @@ class BatchAnalysisWorker(QThread):
 
         median_global_mad = float(np.median(mad_scores)) if mad_scores else 1.0
         cut_thresh = max(20.0, median_global_mad * 8.0)
-        scene_cuts = [i for i, m in enumerate(mad_scores) if m > cut_thresh]
+        # Un cambio scena è un picco ISOLATO: oltre alla soglia globale deve staccarsi nettamente
+        # dai frame vicini. Così una sequenza con movimento rapido (MAD alto ma costante) non diventa
+        # una raffica di "tagli", e un frame mancante (salto ~2x) resta un frame mancante.
+        scene_cuts = []
+        for i, m in enumerate(mad_scores):
+            if m <= cut_thresh:
+                continue
+            neigh = [mad_scores[j] for j in range(max(0, i - 6), min(n - 1, i + 7)) if j != i]
+            if not neigh or m > 3.0 * float(np.median(neigh)):
+                scene_cuts.append(i)
         cut_set = set(scene_cuts)
 
         ratios = []
@@ -542,21 +648,31 @@ class BatchAnalysisWorker(QThread):
                     pos += period
 
         missing_set = set(best_period_drops)
+
+        # Duplicati / frame congelati: il movimento crolla rispetto ai vicini e poi riprende.
+        # Nei video generati (AI) o ricompressi il frame "fermo" non è mai identico al bit
+        # (grana, artefatti): se il crollo relativo è netto (<15% del movimento dei vicini)
+        # non si pretende anche un MAD assoluto minimo.
+        duplicate_indices = []
         for i in range(n - 1):
             if i in cut_set or i in missing_set:
+                continue
+            if local_refs[i] > 0.35 and ratios[i] < 0.20 and mad_ratios[i] < 0.22 and (
+                mad_scores[i] < 0.40 or ratios[i] < 0.15
+            ):
+                duplicate_indices.append(i)
+        dup_set = set(duplicate_indices)
+
+        # Frame mancanti isolati. Un salto subito dopo un frame congelato NON è un frame in più da
+        # inserire: è il frame che il duplicato ha rimpiazzato (verrà sostituito, conteggio invariato).
+        for i in range(n - 1):
+            if i in cut_set or i in missing_set or i in dup_set or (i - 1) in dup_set:
                 continue
             if local_refs[i] > 0.25 and ratios[i] > 1.85 and mad_ratios[i] > 1.35:
                 if (i - 1) not in missing_set and (i + 1) not in missing_set:
                     missing_set.add(i)
 
         missing_indices = sorted(missing_set)
-
-        duplicate_indices = []
-        for i in range(n - 1):
-            if i in cut_set or i in missing_set:
-                continue
-            if local_refs[i] > 0.35 and ratios[i] < 0.20 and mad_ratios[i] < 0.22 and mad_scores[i] < 0.40:
-                duplicate_indices.append(i)
 
         analysis = {
             "num_frames": n,
@@ -569,6 +685,8 @@ class BatchAnalysisWorker(QThread):
             "duplicate_indices": duplicate_indices,
             "cadence_period": best_period,
             "cadence_phase": best_phase,
+            "frame_times": frame_times,
+            "frame_timing": summarize_frame_timing(frame_times),
         }
         return meta, analysis
 
@@ -632,6 +750,7 @@ class BatchExportWorker(QThread):
             get_ffmpeg_bin("ffmpeg"),
             "-v", "error",
             "-i", input_path,
+            "-fps_mode", "passthrough",
             "-f", "rawvideo",
             "-pix_fmt", "rgb48le",
             "-",
@@ -973,7 +1092,7 @@ class PreviewGenerationWorker(QThread):
             n_total = analysis["num_frames"]
             s_frame = max(0, min(self.start_frame, max(0, n_total - 4)))
             count = min(self.num_frames, n_total - s_frame)
-            start_sec = s_frame / fps
+            start_sec = seek_time(meta, analysis, s_frame)
 
             self.progress.emit(10, "Estrazione fotogrammi del momento selezionato...")
             cmd = [
@@ -981,6 +1100,7 @@ class PreviewGenerationWorker(QThread):
                 "-v", "error",
                 "-ss", f"{start_sec:.4f}",
                 "-i", meta["path"],
+                "-fps_mode", "passthrough",
                 "-frames:v", str(count),
                 "-vf", f"scale={pw}:{ph}",
                 "-f", "rawvideo",
@@ -1412,10 +1532,11 @@ class AnomalyThumbnailsWorker(QThread):
 
     thumb_ready = pyqtSignal(int, int, QImage)
 
-    def __init__(self, video_path: str, fps: float, anomaly_frames: list[int]):
+    def __init__(self, video_path: str, fps: float, anomaly_frames: list[int], frame_times: list[float] | None = None):
         super().__init__()
         self.video_path = video_path
         self.fps = fps or 24.0
+        self.frame_times = frame_times or []
         self.anomaly_frames = anomaly_frames
         self._abort = False
 
@@ -1428,12 +1549,13 @@ class AnomalyThumbnailsWorker(QThread):
         for pos, f_idx in enumerate(self.anomaly_frames):
             if self._abort:
                 break
-            t_sec = f_idx / self.fps
+            t_sec = seek_time({"fps": self.fps}, {"frame_times": self.frame_times}, f_idx)
             cmd = [
                 get_ffmpeg_bin("ffmpeg"),
                 "-v", "error",
                 "-ss", f"{t_sec:.4f}",
                 "-i", self.video_path,
+                "-fps_mode", "passthrough",
                 "-frames:v", "1",
                 "-vf", f"scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black",
                 "-f", "rawvideo",
@@ -2140,6 +2262,7 @@ class PreviewComparisonDialog(QDialog):
             self.meta["path"],
             self.meta.get("fps", 24.0) or 24.0,
             self.anomaly_frames,
+            (self.item.analysis or {}).get("frame_times"),
         )
         self.thumb_worker.thumb_ready.connect(self._on_thumb_ready)
         self.thumb_worker.start()
@@ -2405,11 +2528,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.6 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.7 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.6")
+        self.setWindowTitle("MONOVIDEOFIX v1.7")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -3181,7 +3304,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.6")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.7")
         except Exception:
             pass
     app = QApplication(sys.argv)
