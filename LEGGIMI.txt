@@ -1,12 +1,12 @@
 ========================================================================
-MONOVIDEOFIX v1.9 (Versione Portable)
+MONOVIDEOFIX v1.10 (Versione Portable)
 Seedance FPS & Judder Repair Tool
 ========================================================================
 
 Nessuna installazione richiesta (include già Python, OpenCV, PyQt5 e FFmpeg).
 
 COME USARE IL PROGRAMMA:
-1. Fai doppio clic su "MONOVIDEOFIX_v1.9.exe" per avviare l'applicazione.
+1. Fai doppio clic su "MONOVIDEOFIX_v1.10.exe" per avviare l'applicazione.
    - Avvio ultra-rapido: se FFmpeg/FFprobe sono già presenti nel PC (o nella
      cache locale dopo il primo avvio), salta la fase di estrazione!
 2. Trascina uno o più file video (o un'intera cartella) in qualsiasi punto
@@ -18,7 +18,7 @@ COME USARE IL PROGRAMMA:
    - Timestamp irregolari (video a framerate variabile, es. frame da 50/33 ms
      alternati): l'export a FPS costanti li riallinea e toglie il judder
    Se un video con scatti visibili risulta senza errori, alza lo slider
-   "SENSIBILITÀ" (1-10, predefinito 5): i risultati si aggiornano subito.
+   "SENSIBILITÀ" (1-10, predefinito 5): al rilascio il video viene rianalizzato.
    Se vengono segnalati errori che non vedi, abbassalo. "Applica a tutti"
    usa la stessa sensibilità per tutta la coda.
 4. Clicca su "👁 Anteprima & Verifica Correzione" per aprire il confronto

@@ -2617,11 +2617,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.9 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.10 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.9")
+        self.setWindowTitle("MONOVIDEOFIX v1.10")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2795,7 +2795,7 @@ class VideoJudderFixerWindow(QMainWindow):
             "Sensibilità del rilevamento per il video selezionato.\n"
             "Alzala se un video con scatti visibili risulta senza errori (falsi negativi);\n"
             "abbassala se vengono segnalati errori che non vedi (falsi positivi).\n"
-            "Il risultato si aggiorna subito, senza rianalizzare il video."
+            "Al rilascio dello slider il video viene rianalizzato da capo."
         )
         self.sens_slider.setStyleSheet(
             """
@@ -2809,6 +2809,9 @@ class VideoJudderFixerWindow(QMainWindow):
             QSlider::handle:horizontal:disabled { background: #C7D2FE; }
             """
         )
+        # Niente tracking: durante il trascinamento si aggiorna solo l'etichetta, l'analisi riparte al rilascio
+        self.sens_slider.setTracking(False)
+        self.sens_slider.sliderMoved.connect(self._update_sensitivity_label)
         self.sens_slider.valueChanged.connect(self._on_sensitivity_changed)
         self.sens_value_lbl = QLabel()
         self.sens_value_lbl.setMinimumWidth(130)
@@ -3261,13 +3264,16 @@ class VideoJudderFixerWindow(QMainWindow):
         self._update_sensitivity_label(level)
 
     def _apply_sensitivity(self, row: int, level: int):
+        """Imposta la sensibilità e rimette il video in coda per una nuova analisi completa."""
         item = self.batch_items[row]
         item.sensitivity = level
-        if item.analysis is not None and item.meta is not None:
-            item.analysis = reanalyze(item.analysis, level)
-            item.report_text = build_report_text(item.meta, item.analysis)
+        if item.analysis is not None:
+            item.analysis = None
+            item.report_text = ""
             item.exported = False
-            item.status = "Pronto"
+            item.error_msg = ""
+            item.status = "In attesa analisi..."
+        # Se il video è già in analisi, al termine verrà applicata la sensibilità più recente
         self._refresh_table_row(row)
 
     def _on_sensitivity_changed(self, level: int):
@@ -3275,14 +3281,19 @@ class VideoJudderFixerWindow(QMainWindow):
         row = self.get_selected_row()
         if row < 0 or row >= len(self.batch_items):
             return
+        item = self.batch_items[row]
+        if item.sensitivity == level and item.analysis is not None:
+            return
         self._apply_sensitivity(row, level)
+        self._start_pending_analyses()
         self._on_table_selection_changed()
 
     def _apply_sensitivity_to_all(self):
         level = self.sens_slider.value()
         for row in range(len(self.batch_items)):
-            if self.batch_items[row].sensitivity != level or self.batch_items[row].analysis is None:
+            if self.batch_items[row].sensitivity != level:
                 self._apply_sensitivity(row, level)
+        self._start_pending_analyses()
         self._on_table_selection_changed()
 
     def _set_sensitivity_enabled(self, enabled: bool):
@@ -3379,6 +3390,10 @@ class VideoJudderFixerWindow(QMainWindow):
         if idx >= len(self.batch_items):
             return
         item = self.batch_items[idx]
+        if analysis.get("sensitivity") != item.sensitivity:
+            # Sensibilità cambiata mentre il video era in analisi: le misure sono le stesse,
+            # si riclassifica con il livello più recente.
+            analysis = reanalyze(analysis, item.sensitivity)
         item.meta = meta
         item.analysis = analysis
 
@@ -3509,7 +3524,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.9")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.10")
         except Exception:
             pass
     app = QApplication(sys.argv)
