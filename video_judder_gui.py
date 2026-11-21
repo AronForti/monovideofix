@@ -58,6 +58,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QShortcut,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -85,6 +86,7 @@ class BatchVideoItem:
     report_text: str = ""
     exported: bool = False
     error_msg: str = ""
+    sensitivity: int = 5
 
     def update_output_path(self):
         in_path = Path(self.path)
@@ -314,6 +316,211 @@ def summarize_frame_timing(frame_times: list[float]) -> dict | None:
     }
 
 
+SENSITIVITY_MIN = 1
+SENSITIVITY_MAX = 10
+SENSITIVITY_DEFAULT = 5
+
+
+def sensitivity_label(level: int) -> str:
+    if level <= 2:
+        return "Bassa"
+    if level <= 4:
+        return "Medio-bassa"
+    if level == 5:
+        return "Standard"
+    if level <= 7:
+        return "Alta"
+    if level <= 9:
+        return "Molto alta"
+    return "Massima"
+
+
+def sensitivity_thresholds(level: int) -> dict:
+    """
+    Soglie di rilevamento in funzione della sensibilità (1-10). Il livello 5 riproduce esattamente
+    le soglie storiche; ogni +4 livelli dimezza "l'eccesso" richiesto (salto, crollo di movimento),
+    ogni -4 livelli lo raddoppia. Più sensibilità = meno falsi negativi, più rischio di falsi positivi.
+    """
+    level = int(min(SENSITIVITY_MAX, max(SENSITIVITY_MIN, level)))
+    f = 1.0 if level == SENSITIVITY_DEFAULT else 2.0 ** (-(level - SENSITIVITY_DEFAULT) / 4.0)
+    return {
+        "level": level,
+        # cambi scena: picco locale richiesto (più sensibilità → meno tagli che nascondono errori)
+        "cut_local_factor": 3.0 / f,
+        # cadenza periodica di frame mancanti
+        "cadence_high": 1.0 + 0.38 * f,
+        "cadence_median": 1.0 + 0.55 * f,
+        "cadence_coverage": min(0.90, max(0.50, 0.75 - 0.04 * (level - SENSITIVITY_DEFAULT))),
+        # frame mancante isolato (salto di movimento)
+        "missing_ratio": 1.0 + 0.85 * f,
+        "missing_mad_ratio": 1.0 + 0.35 * f,
+        "missing_min_motion": 0.25 * f,
+        # duplicato / frame congelato (crollo di movimento)
+        "dup_ratio": min(0.50, 0.20 / f),
+        "dup_mad_ratio": min(0.50, 0.22 / f),
+        "dup_abs_mad": 0.40 / f,
+        "dup_strong_ratio": min(0.40, 0.15 / f),
+        "dup_min_motion": 0.35 * f,
+    }
+
+
+def detect_anomalies(
+    mad_scores: list[float],
+    p90_disp: list[float],
+    med_disp: list[float],
+    frame_times: list[float] | None = None,
+    sensitivity: int = SENSITIVITY_DEFAULT,
+) -> dict:
+    """
+    Classifica le transizioni (tagli, frame mancanti, duplicati) a partire dalle misure già calcolate
+    (MAD e spostamenti Lucas-Kanade per ogni coppia di frame). Non decodifica nulla: si può
+    rieseguire all'istante quando l'utente cambia la sensibilità.
+    """
+    th = sensitivity_thresholds(sensitivity)
+    n = len(mad_scores) + 1
+    frame_times = frame_times or []
+
+    median_global_mad = float(np.median(mad_scores)) if mad_scores else 1.0
+    cut_thresh = max(20.0, median_global_mad * 8.0)
+    # Un cambio scena è un picco ISOLATO: oltre alla soglia globale deve staccarsi nettamente
+    # dai frame vicini. Così una sequenza con movimento rapido (MAD alto ma costante) non diventa
+    # una raffica di "tagli", e un frame mancante (salto ~2x) resta un frame mancante.
+    scene_cuts = []
+    for i, m in enumerate(mad_scores):
+        if m <= cut_thresh:
+            continue
+        neigh = [mad_scores[j] for j in range(max(0, i - 6), min(n - 1, i + 7)) if j != i]
+        if not neigh or m > th["cut_local_factor"] * float(np.median(neigh)):
+            scene_cuts.append(i)
+    cut_set = set(scene_cuts)
+
+    ratios = []
+    mad_ratios = []
+    local_refs = []
+    for i in range(n - 1):
+        if i in cut_set:
+            ratios.append(1.0)
+            mad_ratios.append(1.0)
+            local_refs.append(p90_disp[i])
+            continue
+        neigh_p90 = [
+            p90_disp[j]
+            for j in range(max(0, i - 6), min(n - 1, i + 7))
+            if j != i and j not in cut_set
+        ]
+        neigh_mad = [
+            mad_scores[j]
+            for j in range(max(0, i - 6), min(n - 1, i + 7))
+            if j != i and j not in cut_set
+        ]
+        ref_p90 = float(np.percentile(neigh_p90, 45)) if neigh_p90 else 1.0
+        ref_mad = float(np.percentile(neigh_mad, 45)) if neigh_mad else 1.0
+        local_refs.append(ref_p90)
+        ratios.append(p90_disp[i] / max(ref_p90, 1e-4))
+        mad_ratios.append(mad_scores[i] / max(ref_mad, 1e-4))
+
+    best_period = None
+    best_phase = None
+    best_period_drops = []
+    candidate_periods = [24, 25, 30, 20, 15, 12, 10, 8, 6, 5, 4]
+    for period in candidate_periods:
+        if n < period * 2:
+            continue
+        # Valuta TUTTE le fasi e tiene la migliore (non la prima che supera la soglia):
+        # altrimenti una fase sfasata di 1 frame può vincere solo perché viene provata prima.
+        best_score = None
+        for phase in range(period):
+            idxs = [i for i in range(phase, n - 1, period) if i not in cut_set]
+            if len(idxs) < 2:
+                continue
+            phase_ratios = [ratios[i] for i in idxs]
+            high_count = sum(1 for r in phase_ratios if r >= th["cadence_high"])
+            med_r = float(np.median(phase_ratios))
+            if med_r >= th["cadence_median"] and high_count >= max(2, int(th["cadence_coverage"] * len(idxs))):
+                score = (high_count, med_r)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_phase = phase
+        if best_score is not None:
+            best_period = period
+            break
+
+    if best_period is not None:
+        # Aggancio di fase: ogni salto atteso viene cercato a ±2 frame dalla posizione prevista
+        # e la cadenza si ri-aggancia al picco reale (un duplicato o un taglio può spostarla di 1 frame).
+        # Dove la scena si muove ma non c'è alcun salto, NON manca nessun frame → non si inserisce nulla.
+        # Solo nelle scene quasi statiche (salto non misurabile) ci si fida della cadenza.
+        pos = best_phase
+        while pos < n - 1:
+            window = [j for j in range(max(0, pos - 2), min(n - 1, pos + 3)) if j not in cut_set]
+            peak = max(window, key=lambda j: ratios[j]) if window else None
+            if peak is not None and ratios[peak] >= th["cadence_high"]:
+                best_period_drops.append(peak)
+                pos = peak + period
+            else:
+                if pos not in cut_set and local_refs[pos] <= 0.25:
+                    best_period_drops.append(pos)
+                pos += period
+
+    missing_set = set(best_period_drops)
+
+    # Duplicati / frame congelati: il movimento crolla rispetto ai vicini e poi riprende.
+    # Nei video generati (AI) o ricompressi il frame "fermo" non è mai identico al bit
+    # (grana, artefatti): se il crollo relativo è netto non si pretende anche un MAD assoluto minimo.
+    duplicate_indices = []
+    for i in range(n - 1):
+        if i in cut_set or i in missing_set:
+            continue
+        if (
+            local_refs[i] > th["dup_min_motion"]
+            and ratios[i] < th["dup_ratio"]
+            and mad_ratios[i] < th["dup_mad_ratio"]
+            and (mad_scores[i] < th["dup_abs_mad"] or ratios[i] < th["dup_strong_ratio"])
+        ):
+            duplicate_indices.append(i)
+    dup_set = set(duplicate_indices)
+
+    # Frame mancanti isolati. Un salto subito dopo un frame congelato NON è un frame in più da
+    # inserire: è il frame che il duplicato ha rimpiazzato (verrà sostituito, conteggio invariato).
+    for i in range(n - 1):
+        if i in cut_set or i in missing_set or i in dup_set or (i - 1) in dup_set:
+            continue
+        if (
+            local_refs[i] > th["missing_min_motion"]
+            and ratios[i] > th["missing_ratio"]
+            and mad_ratios[i] > th["missing_mad_ratio"]
+        ):
+            if (i - 1) not in missing_set and (i + 1) not in missing_set:
+                missing_set.add(i)
+
+    return {
+        "num_frames": n,
+        "mad_scores": mad_scores,
+        "med_disp": med_disp,
+        "p90_disp": p90_disp,
+        "ratios": ratios,
+        "scene_cuts": scene_cuts,
+        "missing_indices": sorted(missing_set),
+        "duplicate_indices": duplicate_indices,
+        "cadence_period": best_period,
+        "cadence_phase": best_phase,
+        "frame_times": frame_times,
+        "frame_timing": summarize_frame_timing(frame_times),
+        "sensitivity": th["level"],
+    }
+
+
+def reanalyze(analysis: dict, sensitivity: int) -> dict:
+    """Ricalcola il rilevamento con un'altra sensibilità riusando le misure già salvate."""
+    return detect_anomalies(
+        analysis["mad_scores"],
+        analysis["p90_disp"],
+        analysis["med_disp"],
+        analysis.get("frame_times"),
+        sensitivity,
+    )
+
+
 def build_report_text(meta: dict, analysis: dict) -> str:
     """Formatta il report dettagliato dell'analisi per un singolo file."""
     missing = analysis["missing_indices"]
@@ -326,6 +533,8 @@ def build_report_text(meta: dict, analysis: dict) -> str:
         f"Sorgente   : {meta['width']}x{meta['height']} @ {meta['fps']:.3f} fps | "
         f"Codec: {meta['codec_raw']} ({meta['pix_fmt']}) | Frame: {analysis['num_frames']}",
     ]
+    level = analysis.get("sensitivity", SENSITIVITY_DEFAULT)
+    lines.append(f"Sensibilità : {level}/10 ({sensitivity_label(level)})")
     timing = analysis.get("frame_timing")
     if meta.get("is_vfr") or (timing and timing["irregular_share"] > 0.05):
         durs = ", ".join(f"{d:g} ms ×{c}" for d, c in (timing or {}).get("durations_ms", []))
@@ -487,13 +696,15 @@ class BatchAnalysisWorker(QThread):
                 continue
             self.item_started.emit(idx)
             try:
-                meta, analysis = self._analyze_single(idx, item.path)
+                meta, analysis = self._analyze_single(idx, item.path, item.sensitivity)
                 self.item_finished.emit(idx, meta, analysis)
             except Exception as exc:
                 self.item_error.emit(idx, str(exc))
         self.all_finished.emit()
 
-    def _analyze_single(self, item_idx: int, video_path: str) -> tuple[dict, dict]:
+    def _analyze_single(
+        self, item_idx: int, video_path: str, sensitivity: int = SENSITIVITY_DEFAULT
+    ) -> tuple[dict, dict]:
         self.item_progress.emit(item_idx, 5, "Lettura metadati...")
         meta = probe_video(video_path)
 
@@ -565,129 +776,7 @@ class BatchAnalysisWorker(QThread):
                 pct = min(95, 50 + int(45 * i / (n - 1)))
                 self.item_progress.emit(item_idx, pct, f"Optical Flow {i}/{n-1}...")
 
-        median_global_mad = float(np.median(mad_scores)) if mad_scores else 1.0
-        cut_thresh = max(20.0, median_global_mad * 8.0)
-        # Un cambio scena è un picco ISOLATO: oltre alla soglia globale deve staccarsi nettamente
-        # dai frame vicini. Così una sequenza con movimento rapido (MAD alto ma costante) non diventa
-        # una raffica di "tagli", e un frame mancante (salto ~2x) resta un frame mancante.
-        scene_cuts = []
-        for i, m in enumerate(mad_scores):
-            if m <= cut_thresh:
-                continue
-            neigh = [mad_scores[j] for j in range(max(0, i - 6), min(n - 1, i + 7)) if j != i]
-            if not neigh or m > 3.0 * float(np.median(neigh)):
-                scene_cuts.append(i)
-        cut_set = set(scene_cuts)
-
-        ratios = []
-        mad_ratios = []
-        local_refs = []
-        for i in range(n - 1):
-            if i in cut_set:
-                ratios.append(1.0)
-                mad_ratios.append(1.0)
-                local_refs.append(p90_disp[i])
-                continue
-            neigh_p90 = [
-                p90_disp[j]
-                for j in range(max(0, i - 6), min(n - 1, i + 7))
-                if j != i and j not in cut_set
-            ]
-            neigh_mad = [
-                mad_scores[j]
-                for j in range(max(0, i - 6), min(n - 1, i + 7))
-                if j != i and j not in cut_set
-            ]
-            ref_p90 = float(np.percentile(neigh_p90, 45)) if neigh_p90 else 1.0
-            ref_mad = float(np.percentile(neigh_mad, 45)) if neigh_mad else 1.0
-            local_refs.append(ref_p90)
-            ratios.append(p90_disp[i] / max(ref_p90, 1e-4))
-            mad_ratios.append(mad_scores[i] / max(ref_mad, 1e-4))
-
-        best_period = None
-        best_phase = None
-        best_period_drops = []
-        candidate_periods = [24, 25, 30, 20, 15, 12, 10, 8, 6, 5, 4]
-        for period in candidate_periods:
-            if n < period * 2:
-                continue
-            # Valuta TUTTE le fasi e tiene la migliore (non la prima che supera la soglia):
-            # altrimenti una fase sfasata di 1 frame può vincere solo perché viene provata prima.
-            best_score = None
-            for phase in range(period):
-                idxs = [i for i in range(phase, n - 1, period) if i not in cut_set]
-                if len(idxs) < 2:
-                    continue
-                phase_ratios = [ratios[i] for i in idxs]
-                high_count = sum(1 for r in phase_ratios if r >= 1.38)
-                med_r = float(np.median(phase_ratios))
-                if med_r >= 1.55 and high_count >= max(2, int(0.75 * len(idxs))):
-                    score = (high_count, med_r)
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_phase = phase
-            if best_score is not None:
-                best_period = period
-                break
-
-        if best_period is not None:
-            # Aggancio di fase: ogni salto atteso viene cercato a ±2 frame dalla posizione prevista
-            # e la cadenza si ri-aggancia al picco reale (un duplicato o un taglio può spostarla di 1 frame).
-            # Dove la scena si muove ma non c'è alcun salto, NON manca nessun frame → non si inserisce nulla.
-            # Solo nelle scene quasi statiche (salto non misurabile) ci si fida della cadenza.
-            pos = best_phase
-            while pos < n - 1:
-                window = [j for j in range(max(0, pos - 2), min(n - 1, pos + 3)) if j not in cut_set]
-                peak = max(window, key=lambda j: ratios[j]) if window else None
-                if peak is not None and ratios[peak] >= 1.38:
-                    best_period_drops.append(peak)
-                    pos = peak + period
-                else:
-                    if pos not in cut_set and local_refs[pos] <= 0.25:
-                        best_period_drops.append(pos)
-                    pos += period
-
-        missing_set = set(best_period_drops)
-
-        # Duplicati / frame congelati: il movimento crolla rispetto ai vicini e poi riprende.
-        # Nei video generati (AI) o ricompressi il frame "fermo" non è mai identico al bit
-        # (grana, artefatti): se il crollo relativo è netto (<15% del movimento dei vicini)
-        # non si pretende anche un MAD assoluto minimo.
-        duplicate_indices = []
-        for i in range(n - 1):
-            if i in cut_set or i in missing_set:
-                continue
-            if local_refs[i] > 0.35 and ratios[i] < 0.20 and mad_ratios[i] < 0.22 and (
-                mad_scores[i] < 0.40 or ratios[i] < 0.15
-            ):
-                duplicate_indices.append(i)
-        dup_set = set(duplicate_indices)
-
-        # Frame mancanti isolati. Un salto subito dopo un frame congelato NON è un frame in più da
-        # inserire: è il frame che il duplicato ha rimpiazzato (verrà sostituito, conteggio invariato).
-        for i in range(n - 1):
-            if i in cut_set or i in missing_set or i in dup_set or (i - 1) in dup_set:
-                continue
-            if local_refs[i] > 0.25 and ratios[i] > 1.85 and mad_ratios[i] > 1.35:
-                if (i - 1) not in missing_set and (i + 1) not in missing_set:
-                    missing_set.add(i)
-
-        missing_indices = sorted(missing_set)
-
-        analysis = {
-            "num_frames": n,
-            "mad_scores": mad_scores,
-            "med_disp": med_disp,
-            "p90_disp": p90_disp,
-            "ratios": ratios,
-            "scene_cuts": scene_cuts,
-            "missing_indices": missing_indices,
-            "duplicate_indices": duplicate_indices,
-            "cadence_period": best_period,
-            "cadence_phase": best_phase,
-            "frame_times": frame_times,
-            "frame_timing": summarize_frame_timing(frame_times),
-        }
+        analysis = detect_anomalies(mad_scores, p90_disp, med_disp, frame_times, sensitivity)
         return meta, analysis
 
 
@@ -2528,11 +2617,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.8 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.9 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.8")
+        self.setWindowTitle("MONOVIDEOFIX v1.9")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2683,6 +2772,62 @@ class VideoJudderFixerWindow(QMainWindow):
         metrics_row.addWidget(dup_frame)
         metrics_row.addWidget(cuts_frame)
         card_layout.addLayout(metrics_row)
+
+        sens_row = QHBoxLayout()
+        sens_row.setSpacing(10)
+        sens_title = QLabel("SENSIBILITÀ")
+        sens_title.setStyleSheet(
+            "background: transparent; font-size: 11px; font-weight: 800; color: #FFFFFF; letter-spacing: 1px;"
+        )
+        sens_low = QLabel("Bassa")
+        sens_high = QLabel("Alta")
+        for lbl in (sens_low, sens_high):
+            lbl.setStyleSheet("background: transparent; font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.80);")
+        self.sens_slider = QSlider(Qt.Horizontal)
+        self.sens_slider.setRange(SENSITIVITY_MIN, SENSITIVITY_MAX)
+        self.sens_slider.setValue(SENSITIVITY_DEFAULT)
+        self.sens_slider.setSingleStep(1)
+        self.sens_slider.setPageStep(1)
+        self.sens_slider.setTickPosition(QSlider.TicksBelow)
+        self.sens_slider.setTickInterval(1)
+        self.sens_slider.setCursor(Qt.PointingHandCursor)
+        self.sens_slider.setToolTip(
+            "Sensibilità del rilevamento per il video selezionato.\n"
+            "Alzala se un video con scatti visibili risulta senza errori (falsi negativi);\n"
+            "abbassala se vengono segnalati errori che non vedi (falsi positivi).\n"
+            "Il risultato si aggiorna subito, senza rianalizzare il video."
+        )
+        self.sens_slider.setStyleSheet(
+            """
+            QSlider { background: transparent; min-height: 26px; }
+            QSlider::groove:horizontal { height: 6px; background: rgba(255,255,255,0.35); border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #FFFFFF; border-radius: 3px; }
+            QSlider::handle:horizontal {
+                background: #FFFFFF; border: 3px solid #0047FF; width: 14px; height: 14px;
+                margin: -7px 0; border-radius: 10px;
+            }
+            QSlider::handle:horizontal:disabled { background: #C7D2FE; }
+            """
+        )
+        self.sens_slider.valueChanged.connect(self._on_sensitivity_changed)
+        self.sens_value_lbl = QLabel()
+        self.sens_value_lbl.setMinimumWidth(130)
+        self.sens_value_lbl.setStyleSheet("background: transparent; font-size: 13px; font-weight: 800; color: #FFFFFF;")
+        self.sens_all_btn = QPushButton("Applica a tutti")
+        self.sens_all_btn.setObjectName("PreviewBtn")
+        self.sens_all_btn.setCursor(Qt.PointingHandCursor)
+        self.sens_all_btn.setToolTip("Usa questa sensibilità per tutti i video in coda")
+        self.sens_all_btn.clicked.connect(self._apply_sensitivity_to_all)
+        sens_row.addWidget(sens_title)
+        sens_row.addSpacing(6)
+        sens_row.addWidget(sens_low)
+        sens_row.addWidget(self.sens_slider, 1)
+        sens_row.addWidget(sens_high)
+        sens_row.addSpacing(6)
+        sens_row.addWidget(self.sens_value_lbl)
+        sens_row.addWidget(self.sens_all_btn)
+        card_layout.addLayout(sens_row)
+        self._update_sensitivity_label(SENSITIVITY_DEFAULT)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -3106,6 +3251,44 @@ class VideoJudderFixerWindow(QMainWindow):
         self.log_box.clear()
         self.out_preview_lbl.setText("Output: —")
 
+    def _update_sensitivity_label(self, level: int):
+        self.sens_value_lbl.setText(f"{level}/10 · {sensitivity_label(level)}")
+
+    def _set_slider_quietly(self, level: int):
+        self.sens_slider.blockSignals(True)
+        self.sens_slider.setValue(level)
+        self.sens_slider.blockSignals(False)
+        self._update_sensitivity_label(level)
+
+    def _apply_sensitivity(self, row: int, level: int):
+        item = self.batch_items[row]
+        item.sensitivity = level
+        if item.analysis is not None and item.meta is not None:
+            item.analysis = reanalyze(item.analysis, level)
+            item.report_text = build_report_text(item.meta, item.analysis)
+            item.exported = False
+            item.status = "Pronto"
+        self._refresh_table_row(row)
+
+    def _on_sensitivity_changed(self, level: int):
+        self._update_sensitivity_label(level)
+        row = self.get_selected_row()
+        if row < 0 or row >= len(self.batch_items):
+            return
+        self._apply_sensitivity(row, level)
+        self._on_table_selection_changed()
+
+    def _apply_sensitivity_to_all(self):
+        level = self.sens_slider.value()
+        for row in range(len(self.batch_items)):
+            if self.batch_items[row].sensitivity != level or self.batch_items[row].analysis is None:
+                self._apply_sensitivity(row, level)
+        self._on_table_selection_changed()
+
+    def _set_sensitivity_enabled(self, enabled: bool):
+        self.sens_slider.setEnabled(enabled)
+        self.sens_all_btn.setEnabled(enabled)
+
     def _on_table_selection_changed(self):
         row = self.get_selected_row()
         if row < 0 or row >= len(self.batch_items):
@@ -3113,6 +3296,7 @@ class VideoJudderFixerWindow(QMainWindow):
             return
 
         item = self.batch_items[row]
+        self._set_slider_quietly(item.sensitivity)
         self.out_preview_lbl.setText(f"File di output: {item.output_path}")
 
         if item.meta and item.analysis:
@@ -3246,6 +3430,7 @@ class VideoJudderFixerWindow(QMainWindow):
 
         self.export_btn.setEnabled(False)
         self.drop_area.setEnabled(False)
+        self._set_sensitivity_enabled(False)
 
         self.export_worker = BatchExportWorker(self.batch_items)
         self.export_worker.item_started.connect(self._on_export_item_started)
@@ -3297,6 +3482,7 @@ class VideoJudderFixerWindow(QMainWindow):
 
     def _on_export_all_finished(self, success_count: int, total_count: int):
         self.drop_area.setEnabled(True)
+        self._set_sensitivity_enabled(True)
         self._update_queue_header()
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat(f"Batch completato: {success_count}/{total_count} video esportati")
@@ -3323,7 +3509,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.8")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.9")
         except Exception:
             pass
     app = QApplication(sys.argv)
