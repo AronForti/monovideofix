@@ -2528,11 +2528,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.7 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.8 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.7")
+        self.setWindowTitle("MONOVIDEOFIX v1.8")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2810,6 +2810,25 @@ class VideoJudderFixerWindow(QMainWindow):
                 border: none;
                 color: #FFFFFF;
                 font-family: 'Segoe UI', sans-serif;
+            }
+            QMessageBox {
+                background-color: #FFFFFF;
+            }
+            QMessageBox QLabel {
+                color: #0F172A;
+                font-size: 13px;
+            }
+            QMessageBox QPushButton {
+                background-color: #0047FF;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 22px;
+                min-width: 70px;
+                font-weight: 700;
+            }
+            QMessageBox QPushButton:hover {
+                background-color: #0035C9;
             }
             QFrame#Card {
                 background-color: #0035C9;
@@ -3304,7 +3323,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.7")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.8")
         except Exception:
             pass
     app = QApplication(sys.argv)

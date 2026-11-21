@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="96" height="96" alt="MonoVideoFix Logo">
 </p>
 
-<h1 align="center">MONOVIDEOFIX v1.7</h1>
+<h1 align="center">MONOVIDEOFIX v1.8</h1>
 <p align="center">
   <strong>Seedance FPS & Judder Repair Tool</strong><br>
   Strumento desktop con interfaccia grafica (PyQt5) e CLI per l'analisi automatica e la correzione chirurgica di scattini (<em>judder</em>), frame persi e frame duplicati nei video (es. conversioni errate 25 → 24 fps).
@@ -69,8 +69,8 @@ La mappa termica evidenzia quanto si muove ogni zona tra un frame e il successiv
 
 Non è necessario installare Python, OpenCV o FFmpeg:
 
-1. Scarica **`MONOVIDEOFIX_v1.7.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
-2. Avvia **`MONOVIDEOFIX_v1.7.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
+1. Scarica **`MONOVIDEOFIX_v1.8.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
+2. Avvia **`MONOVIDEOFIX_v1.8.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
 3. Trascina i video nella finestra: l'analisi partirà automaticamente.
 4. Clicca su **`👁 Anteprima & Verifica Correzione`** per ispezionare tramite le thumbnail dei momenti anomali, lo zoom sincronizzato, il rallentatore (`0.25x`) o la **Heat-Map Movimento** la risoluzione dei frame mancanti/duplicati.
 5. Scegli gli **FPS** e il **Codec** desiderati (applicati automaticamente a tutta la coda) e clicca su **ESPORTA**.
@@ -115,9 +115,9 @@ python fix_video_judder.py input_video.mp4 --keep-frame-count --bitrate 20M
 Per rigenerare l'eseguibile standalone a singolo file con PyInstaller (includendo automaticamente `ffmpeg.exe` e `ffprobe.exe` con estrazione on-demand):
 
 ```powershell
-pyinstaller --noconfirm --clean MONOVIDEOFIX_v1.7.spec
+pyinstaller --noconfirm --clean MONOVIDEOFIX_v1.8.spec
 ```
-Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.7.exe`.
+Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.8.exe`.
 
 ---
 
@@ -127,7 +127,7 @@ Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.7.exe`.
 | :--- | :--- |
 | `video_judder_gui.py` | Applicazione desktop GUI (PyQt5) con supporto Drag & Drop, Preview Prima/Dopo e coda Batch |
 | `fix_video_judder.py` | Script CLI per analisi ottica e riparazione judder da terminale |
-| `MONOVIDEOFIX_v1.7.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
+| `MONOVIDEOFIX_v1.8.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
 | `requirements.txt` | Elenco delle dipendenze Python del progetto |
 | `LEGGIMI.txt` | Guida rapida per l'utente finale |
 | `monovideofix.ico` / `assets/icon.svg` | Icone dell'applicazione |
