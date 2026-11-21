@@ -13,6 +13,7 @@ Applicazione GUI (PyQt5) con supporto Drag & Drop singolo e Batch (multi-file):
    suffisso "_xxfps".
 """
 
+import bisect
 import ctypes
 import json
 import os
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -521,6 +522,22 @@ def reanalyze(analysis: dict, sensitivity: int) -> dict:
     )
 
 
+def timing_issue(meta: dict, analysis: dict) -> dict | None:
+    """
+    Durate dei frame irregolari (framerate variabile): il video va corretto anche senza frame
+    mancanti/duplicati, perché in riproduzione i frame restano a schermo per tempi diversi.
+    """
+    timing = analysis.get("frame_timing")
+    if not (meta.get("is_vfr") or (timing and timing["irregular_share"] > 0.05)):
+        return None
+    durs = (timing or {}).get("durations_ms", [])
+    return {
+        "durations_ms": durs,
+        "short_text": "/".join(f"{d:g}" for d, _ in sorted(durs[:2])) + " ms" if durs else "variabili",
+        "irregular_count": (timing or {}).get("irregular_count", 0),
+    }
+
+
 def build_report_text(meta: dict, analysis: dict) -> str:
     """Formatta il report dettagliato dell'analisi per un singolo file."""
     missing = analysis["missing_indices"]
@@ -535,19 +552,6 @@ def build_report_text(meta: dict, analysis: dict) -> str:
     ]
     level = analysis.get("sensitivity", SENSITIVITY_DEFAULT)
     lines.append(f"Sensibilità : {level}/10 ({sensitivity_label(level)})")
-    timing = analysis.get("frame_timing")
-    if meta.get("is_vfr") or (timing and timing["irregular_share"] > 0.05):
-        durs = ", ".join(f"{d:g} ms ×{c}" for d, c in (timing or {}).get("durations_ms", []))
-        lines.append(
-            f"[!] TIMESTAMP IRREGOLARI (framerate variabile): passo dichiarato {meta.get('r_frame_rate', 0):g} fps, "
-            f"media reale {meta['fps']:.3f} fps"
-        )
-        if durs:
-            lines.append(f"    Durata dei frame: {durs}")
-        lines.append(
-            "    In riproduzione i frame restano a schermo per tempi diversi → judder anche senza frame persi.\n"
-            f"    L'export a FPS costanti riallinea ogni frame a intervalli identici (1 frame = 1/{meta['closest_fps']} s)."
-        )
     if cuts:
         cuts_str = ", ".join(f"{c}→{c+1} ({frame_time(meta, analysis, c + 1):.2f}s)" for c in cuts)
         lines.append(f"Cambi scena: {cuts_str}")
@@ -581,6 +585,24 @@ def build_report_text(meta: dict, analysis: dict) -> str:
     else:
         lines.append("[✓] Nessun frame duplicato rilevato.")
 
+    t_issue = timing_issue(meta, analysis)
+    lines.append("-" * 68)
+    if t_issue:
+        durs = ", ".join(f"{d:g} ms ×{c}" for d, c in t_issue["durations_ms"])
+        lines.append(
+            f"[!] TEMPI DEI FRAME IRREGOLARI (framerate variabile): passo dichiarato "
+            f"{meta.get('r_frame_rate', 0):g} fps, media reale {meta['fps']:.3f} fps"
+        )
+        if durs:
+            lines.append(f"    Durata dei frame: {durs}")
+        lines.append("    In riproduzione ogni frame resta a schermo per un tempo diverso → judder anche senza frame persi.")
+        lines.append(
+            f"    → DA CORREGGERE: l'export a FPS costanti riallinea ogni frame a intervalli identici "
+            f"(1 frame = 1/{meta['closest_fps']} s). Nell'Anteprima il Prima usa i tempi reali."
+        )
+    else:
+        lines.append("[✓] Tempi dei frame regolari.")
+
     plan = build_correction_plan(analysis)
     lines.append("-" * 68)
     lines.append(
@@ -588,6 +610,7 @@ def build_report_text(meta: dict, analysis: dict) -> str:
         f"(+{len(plan['missing_set'])} mancanti ricostruiti, "
         f"−{len(plan['drop_dup_set'])} duplicati rimossi, "
         f"{len(plan['replace_dup_set'])} duplicati sostituiti)"
+        + ("  •  tempi riallineati" if t_issue else "")
     )
 
     return "\n".join(lines)
@@ -1332,11 +1355,31 @@ class PreviewGenerationWorker(QThread):
             orig_deltas = compute_deltas(orig_lane)
             fixed_deltas = compute_deltas(fixed_lane)
 
+            # Tempi di presentazione: il Prima con i timestamp reali del file (anche irregolari),
+            # il Dopo a intervalli costanti come nel video esportato.
+            ft = analysis.get("frame_times") or []
+            if orig_numbers and len(ft) == n_total:
+                base_t = ft[orig_numbers[0]]
+                orig_times = [ft[k] - base_t for k in orig_numbers]
+                last = orig_numbers[-1]
+                orig_end = (ft[last + 1] - base_t) if last + 1 < len(ft) else orig_times[-1] + 1.0 / fps
+            else:
+                first = orig_numbers[0] if orig_numbers else 0
+                orig_times = [(k - first) / fps for k in orig_numbers]
+                orig_end = len(orig_numbers) / fps
+            tf = self.item.target_fps
+            natural_fps = full_plan["output_count"] / max(meta.get("duration") or (n_total / fps), 1e-3)
+            direct = abs(tf - natural_fps) <= 2.0 or (tf in (24, 25) and round(fps) in (24, 25))
+            fixed_fps = float(tf) if direct else natural_fps
+
             self.progress.emit(100, "Anteprima pronta!")
             self.finished_preview.emit({
                 "start_frame": s_frame,
                 "fps": fps,
                 "target_fps": self.item.target_fps,
+                "orig_times": orig_times,
+                "orig_end": orig_end,
+                "fixed_fps": fixed_fps,
                 "orig_frames": orig_lane,
                 "orig_frame_numbers": orig_numbers,
                 "orig_deltas": orig_deltas,
@@ -1381,6 +1424,7 @@ class MotionTimelineWidget(QWidget):
         self.orig_marks: list[int] = []
         self.fixed_marks: list[int] = []
         self.current_step: int = 0
+        self.current_fixed_step: int = 0
         self.total_steps: int = 1
 
     def set_data(
@@ -1402,10 +1446,14 @@ class MotionTimelineWidget(QWidget):
         self.fixed_marks = list(fixed_marks or [])
         self.total_steps = max(len(orig_deltas), len(fixed_deltas), 1)
         self.current_step = 0
+        self.current_fixed_step = 0
         self.update()
 
-    def set_step(self, step: int):
+    def set_step(self, step: int, fixed_step: int | None = None):
+        """Frame attivo della corsia Originale (e, se diverso, della corsia Corretto)."""
         self.current_step = max(0, min(step, self.total_steps - 1))
+        fs = step if fixed_step is None else fixed_step
+        self.current_fixed_step = max(0, min(fs, self.total_steps - 1))
         self.update()
 
     def _step_from_x(self, x_pos: float) -> int:
@@ -1506,6 +1554,7 @@ class MotionTimelineWidget(QWidget):
             cell_x = left_pad + i * slot_w + gap * 0.5
             cell_w = max(4.0, slot_w - gap)
             is_cur = (i == self.current_step)
+            is_cur_f = (i == self.current_fixed_step)
             has_o = i < n_o
             has_f = i < n_f
 
@@ -1576,7 +1625,7 @@ class MotionTimelineWidget(QWidget):
                 p.setBrush(QColor("#EEF2F7"))
             elif st_f in ("reconstructed_missing", "reconstructed_dup"):
                 p.setBrush(QColor("#F0FDF4"))
-            elif is_cur:
+            elif is_cur_f:
                 p.setBrush(QColor("#EFF6FF"))
             else:
                 p.setBrush(QColor("#F8FAFC"))
@@ -1589,7 +1638,7 @@ class MotionTimelineWidget(QWidget):
                     bar_col_f = QColor("#16A34A")
                     bar_h_f = max(bar_h_f, max_bar_h_f * 0.65)
                 else:
-                    bar_col_f = QColor("#0047FF") if is_cur else QColor("#3B82F6")
+                    bar_col_f = QColor("#0047FF") if is_cur_f else QColor("#3B82F6")
                 p.setBrush(bar_col_f)
                 p.drawRoundedRect(QRectF(
                     fixed_cell.left() + inner_pad,
@@ -1600,12 +1649,17 @@ class MotionTimelineWidget(QWidget):
 
         # 4. Riquadro di selezione del Frame Corrente perfettamente sovrapposto alla cella attiva
         if 0 <= self.current_step < n:
-            cur_x = left_pad + self.current_step * slot_w + gap * 0.5
             cur_w = max(4.0, slot_w - gap)
-            sel_rect = QRectF(cur_x, 5.0, cur_w, h - 10.0)
+            x_o = left_pad + self.current_step * slot_w + gap * 0.5
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor("#0047FF"), 2.4))
-            p.drawRoundedRect(sel_rect, 4.0, 4.0)
+            if self.current_fixed_step == self.current_step:
+                p.drawRoundedRect(QRectF(x_o, 5.0, cur_w, h - 10.0), 4.0, 4.0)
+            else:
+                # Con tempi diversi (es. Prima a framerate variabile) le due corsie avanzano ognuna col proprio ritmo
+                x_f = left_pad + self.current_fixed_step * slot_w + gap * 0.5
+                p.drawRoundedRect(QRectF(x_o, 5.0, cur_w, mid_y - 4.0), 4.0, 4.0)
+                p.drawRoundedRect(QRectF(x_f, mid_y + 0.5, cur_w, h - 5.0 - mid_y - 0.5), 4.0, 4.0)
 
         # 5. Lineette rosse (sopra la selezione, così restano sempre visibili) nei punti in cui manca un frame (Originale) o è stato rimosso un duplicato (Corretto)
         for b in self.orig_marks:
@@ -1999,7 +2053,12 @@ class PreviewComparisonDialog(QDialog):
         self.thumb_cards: dict[int, AnomalyThumbnailCard] = {}
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self._advance_frame)
+        # Riproduzione a orologio: ogni corsia mostra il frame il cui istante è già trascorso
+        self.current_step_f: int = 0
+        self._clock = QElapsedTimer()
+        self._clock_base_ms: float = 0.0
 
         self._build_ui()
         self._setup_shortcuts()
@@ -2027,8 +2086,8 @@ class PreviewComparisonDialog(QDialog):
         """
         n_total = self.analysis["num_frames"]
         if not self.anomaly_frames:
-            s_f = max(0, min(int(n_total * 0.25), max(0, n_total - 24)))
-            return s_f, min(24, n_total - s_f), None, None
+            s_f = max(0, min(int(n_total * 0.25), max(0, n_total - 48)))
+            return s_f, min(48, n_total - s_f), None, None
 
         pos = pos_idx % len(self.anomaly_frames)
         target = self.anomaly_frames[pos]
@@ -2240,7 +2299,16 @@ class PreviewComparisonDialog(QDialog):
                 self.thumb_cards[pos_idx] = card
                 self.thumb_strip_lay.addWidget(card)
         else:
-            empty_lbl = QLabel("Nessun frame duplicato o mancante rilevato in questo video.")
+            t_issue = timing_issue(self.meta, self.analysis)
+            if t_issue:
+                empty_lbl = QLabel(
+                    "Nessun frame duplicato o mancante, ma i TEMPI DEI FRAME sono irregolari "
+                    f"({t_issue['short_text']}): confronta il Prima, riprodotto con i tempi reali, "
+                    f"con il Dopo a intervalli costanti ({1000.0 / max(self.item.target_fps, 1):.1f} ms)."
+                )
+                empty_lbl.setWordWrap(True)
+            else:
+                empty_lbl = QLabel("Nessun frame duplicato o mancante rilevato in questo video.")
             empty_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.85); font-size: 12px; font-weight: 600;")
             self.thumb_strip_lay.addWidget(empty_lbl)
 
@@ -2430,6 +2498,7 @@ class PreviewComparisonDialog(QDialog):
             self._focus_anomaly_frame = None
         else:
             self.current_step = 0
+        self.current_step_f = self.current_step
 
         self.timeline.set_data(
             data["orig_deltas"],
@@ -2446,12 +2515,44 @@ class PreviewComparisonDialog(QDialog):
         self._render_current_step()
         self._restart_timer()
 
-    def _restart_timer(self):
+    # --- Tempi di presentazione delle due corsie (ms, relativi all'inizio della finestra) ---
+    def _orig_times_ms(self) -> list[float]:
+        d = self.preview_data
+        times = d.get("orig_times")
+        if not times or len(times) != len(d["orig_frames"]):
+            fps = d.get("fps", 24.0) or 24.0
+            times = [i / fps for i in range(len(d["orig_frames"]))]
+        return [t * 1000.0 for t in times]
+
+    def _fixed_period_ms(self) -> float:
+        d = self.preview_data
+        return 1000.0 / (d.get("fixed_fps") or d.get("fps") or 24.0)
+
+    def _loop_ms(self) -> float:
+        d = self.preview_data
+        orig_ms = self._orig_times_ms()
+        fps = d.get("fps", 24.0) or 24.0
+        orig_end = float(d.get("orig_end") or (len(orig_ms) / fps)) * 1000.0
+        fixed_end = len(d["fixed_frames"]) * self._fixed_period_ms()
+        return max(orig_end, fixed_end, 1.0)
+
+    def _content_ms_for_step(self, step: int) -> float:
+        orig_ms = self._orig_times_ms()
+        if 0 <= step < len(orig_ms):
+            return orig_ms[step]
+        return step * self._fixed_period_ms()
+
+    def _current_content_ms(self) -> float:
+        if not self._clock.isValid():
+            return self._content_ms_for_step(self.current_step)
+        return self._clock_base_ms + self._clock.elapsed() * self.speed_factor
+
+    def _restart_timer(self, from_ms: float | None = None):
         if not self.preview_data:
             return
-        fps = self.preview_data.get("fps", 24.0) or 24.0
-        interval_ms = max(16, int(round(1000.0 / (fps * self.speed_factor))))
-        self.timer.start(interval_ms)
+        self._clock_base_ms = self._content_ms_for_step(self.current_step) if from_ms is None else from_ms
+        self._clock.restart()
+        self.timer.start(8)
 
     def toggle_play(self):
         if self.timer.isActive():
@@ -2468,6 +2569,7 @@ class PreviewComparisonDialog(QDialog):
             self.timer.stop()
             self.play_btn.setText("\u25b6 Riproduci")
         self.current_step = (self.current_step + delta) % self.total_steps
+        self.current_step_f = self.current_step
         self._render_current_step()
 
     def _jump_to_step(self, step: int):
@@ -2477,12 +2579,14 @@ class PreviewComparisonDialog(QDialog):
             self.timer.stop()
             self.play_btn.setText("\u25b6 Riproduci")
         self.current_step = max(0, min(step, self.total_steps - 1))
+        self.current_step_f = self.current_step
         self._render_current_step()
 
     def _on_speed_changed(self, btn):
+        now_ms = self._current_content_ms() if self.timer.isActive() else None
         self.speed_factor = float(btn.property("speed_val") or 0.25)
         if self.timer.isActive():
-            self._restart_timer()
+            self._restart_timer(now_ms)
 
     def _on_diff_toggled(self, checked: bool):
         self.diff_mode = checked
@@ -2491,8 +2595,21 @@ class PreviewComparisonDialog(QDialog):
     def _advance_frame(self):
         if not self.preview_data:
             return
-        self.current_step = (self.current_step + 1) % self.total_steps
-        self._render_current_step()
+        loop = self._loop_ms()
+        t = self._current_content_ms()
+        if t >= loop:
+            t = t % loop
+            self._clock_base_ms = t
+            self._clock.restart()
+        orig_ms = self._orig_times_ms()
+        n_o = len(self.preview_data["orig_frames"])
+        n_f = len(self.preview_data["fixed_frames"])
+        idx_o = max(0, min(bisect.bisect_right(orig_ms, t + 1e-6) - 1, n_o - 1))
+        idx_f = max(0, min(int((t + 1e-6) // self._fixed_period_ms()), n_f - 1))
+        if idx_o != self.current_step or idx_f != self.current_step_f:
+            self.current_step = idx_o
+            self.current_step_f = idx_f
+            self._render_current_step()
 
     @staticmethod
     def _make_diff_visual(cur_frame: np.ndarray, prev_frame: np.ndarray, status: str, delta_val: float) -> np.ndarray:
@@ -2556,6 +2673,8 @@ class PreviewComparisonDialog(QDialog):
             f"\u2212{len(plan['drop_dup_set'])} rimossi, "
             f"{len(plan['replace_dup_set'])} sostituiti)"
         )
+        if timing_issue(self.meta, self.analysis):
+            text += "  •  tempi riallineati"
         if self.preview_data:
             text += (
                 f"   \u2022   Finestra: {self.preview_data['orig_real_count']} \u2192 "
@@ -2579,7 +2698,16 @@ class PreviewComparisonDialog(QDialog):
 
         # La corsia più corta resta sull'ultimo fotogramma finché l'altra non termina il ciclo
         idx_o = min(self.current_step, len(orig_frames) - 1)
-        idx_f = min(self.current_step, len(fixed_frames) - 1)
+        idx_f = min(self.current_step_f, len(fixed_frames) - 1)
+        orig_ms = self._orig_times_ms()
+        if idx_o + 1 < len(orig_ms):
+            dur_o = orig_ms[idx_o + 1] - orig_ms[idx_o]
+        else:
+            fps_o = self.preview_data.get("fps", 24.0) or 24.0
+            dur_o = float(self.preview_data.get("orig_end") or 0.0) * 1000.0 - orig_ms[idx_o] if orig_ms else 1000.0 / fps_o
+            if dur_o <= 0:
+                dur_o = 1000.0 / fps_o
+        dur_f = self._fixed_period_ms()
 
         st_o = orig_status[idx_o]
         st_f = fixed_status[idx_f]
@@ -2598,13 +2726,15 @@ class PreviewComparisonDialog(QDialog):
 
         f_num_orig = orig_frame_nums[idx_o] if idx_o < len(orig_frame_nums) else idx_o
         self.orig_meta_lbl.setText(
-            f"Frame sorgente #{f_num_orig} (su {src_total})  \u2022  Delta movimento: {orig_deltas[idx_o]:.2f}"
+            f"Frame sorgente #{f_num_orig} (su {src_total})  \u2022  A schermo {dur_o:.1f} ms  \u2022  "
+            f"Delta movimento: {orig_deltas[idx_o]:.2f}"
         )
         f_num_out = fixed_frame_nums[idx_f] if idx_f < len(fixed_frame_nums) else idx_f
         self.fixed_meta_lbl.setText(
-            f"Frame output #{f_num_out} (su {out_total})  \u2022  Delta movimento: {fixed_deltas[idx_f]:.2f}"
+            f"Frame output #{f_num_out} (su {out_total})  \u2022  A schermo {dur_f:.1f} ms  \u2022  "
+            f"Delta movimento: {fixed_deltas[idx_f]:.2f}"
         )
-        self.timeline.set_step(self.current_step)
+        self.timeline.set_step(self.current_step, self.current_step_f)
 
     def closeEvent(self, event):
         self.timer.stop()
@@ -2617,11 +2747,11 @@ class PreviewComparisonDialog(QDialog):
 
 
 class VideoJudderFixerWindow(QMainWindow):
-    """Finestra principale MONOVIDEOFIX v1.10 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
+    """Finestra principale MONOVIDEOFIX v1.11 (Sfondo Blu Cobalto MONOGRID con superfici Bianche e testo Nero)."""
 
     def __init__(self, initial_videos: list[str] | None = None):
         super().__init__()
-        self.setWindowTitle("MONOVIDEOFIX v1.10")
+        self.setWindowTitle("MONOVIDEOFIX v1.11")
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(820, 800)
         self.setAcceptDrops(True)
@@ -2767,10 +2897,17 @@ class VideoJudderFixerWindow(QMainWindow):
         self.missing_box_val, missing_frame = self._create_metric_box("FRAME MANCANTI STIMATI", "—", "#0047FF")
         self.dup_box_val, dup_frame = self._create_metric_box("FRAME DUPLICATI STIMATI", "—", "#0047FF")
         self.cuts_box_val, cuts_frame = self._create_metric_box("CAMBI SCENA", "—", "#000000")
+        self.timing_box_val, timing_frame = self._create_metric_box("TEMPI FRAME", "—", "#0047FF")
+        self.timing_box_val.setToolTip(
+            "Durata di ogni frame sullo schermo.\n"
+            "'Da riallineare' = il file alterna durate diverse (framerate variabile): si vede uno scatto\n"
+            "anche senza frame mancanti. L'export a FPS costanti lo corregge."
+        )
 
         metrics_row.addWidget(missing_frame)
         metrics_row.addWidget(dup_frame)
         metrics_row.addWidget(cuts_frame)
+        metrics_row.addWidget(timing_frame)
         card_layout.addLayout(metrics_row)
 
         sens_row = QHBoxLayout()
@@ -3251,8 +3388,16 @@ class VideoJudderFixerWindow(QMainWindow):
         self.missing_box_val.setText("—")
         self.dup_box_val.setText("—")
         self.cuts_box_val.setText("—")
+        self._set_timing_box("—", None)
         self.log_box.clear()
         self.out_preview_lbl.setText("Output: —")
+
+    def _set_timing_box(self, text: str, problem: bool | None):
+        color = "#EA580C" if problem else ("#16A34A" if problem is False else "#0047FF")
+        self.timing_box_val.setStyleSheet(
+            f"background: transparent; border: none; font-size: 17px; font-weight: 900; color: {color};"
+        )
+        self.timing_box_val.setText(text)
 
     def _update_sensitivity_label(self, level: int):
         self.sens_value_lbl.setText(f"{level}/10 · {sensitivity_label(level)}")
@@ -3325,6 +3470,11 @@ class VideoJudderFixerWindow(QMainWindow):
             self.missing_box_val.setText(f"{len(missing)}  (ogni {period}f)" if period else str(len(missing)))
             self.dup_box_val.setText(str(len(duplicates)))
             self.cuts_box_val.setText(str(len(cuts)))
+            t_issue = timing_issue(meta, analysis)
+            if t_issue:
+                self._set_timing_box(f"Da riallineare ({t_issue['short_text']})", True)
+            else:
+                self._set_timing_box("Regolari", False)
             self.log_box.setPlainText(item.report_text)
         elif item.error_msg:
             self.preview_btn.setEnabled(False)
@@ -3332,6 +3482,7 @@ class VideoJudderFixerWindow(QMainWindow):
             self.missing_box_val.setText("Err")
             self.dup_box_val.setText("Err")
             self.cuts_box_val.setText("Err")
+            self._set_timing_box("Err", None)
             self.log_box.setPlainText(f"Errore durante l'analisi:\n{item.error_msg}")
         else:
             self.preview_btn.setEnabled(False)
@@ -3339,6 +3490,7 @@ class VideoJudderFixerWindow(QMainWindow):
             self.missing_box_val.setText("...")
             self.dup_box_val.setText("...")
             self.cuts_box_val.setText("...")
+            self._set_timing_box("...", None)
             self.log_box.setPlainText(f"In attesa di analisi per:\n{item.path}")
 
     def _on_user_option_changed(self):
@@ -3524,7 +3676,7 @@ def _warmup_ffmpeg_async():
 def main():
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.10")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("monogrid.monovideofix.v1.11")
         except Exception:
             pass
     app = QApplication(sys.argv)

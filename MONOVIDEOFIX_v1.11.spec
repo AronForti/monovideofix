@@ -47,7 +47,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MONOVIDEOFIX_v1.10',
+    name='MONOVIDEOFIX_v1.11',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -63,11 +63,21 @@ exe = EXE(
     icon=['monovideofix.ico'],
 )
 
-# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v1.10.exe
-built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v1.10.exe"
+# Post-build: appende lo ZIP con ffmpeg.exe e ffprobe.exe in coda a MONOVIDEOFIX_v1.11.exe
+built_exe = Path(DISTPATH) / "MONOVIDEOFIX_v1.11.exe"
 if built_exe.is_file():
     print(f"[MONOVIDEOFIX] Incorporamento on-demand di ffmpeg.exe e ffprobe.exe in {built_exe.name}...")
-    with zipfile.ZipFile(built_exe, mode="a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        zf.write(ffmpeg_path, arcname="ffmpeg.exe")
-        zf.write(ffprobe_path, arcname="ffprobe.exe")
+    # L'antivirus può tenere bloccato per qualche secondo l'exe appena scritto: si riprova
+    import time as _time
+    for _attempt in range(10):
+        try:
+            with zipfile.ZipFile(built_exe, mode="a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                zf.write(ffmpeg_path, arcname="ffmpeg.exe")
+                zf.write(ffprobe_path, arcname="ffprobe.exe")
+            break
+        except PermissionError:
+            if _attempt == 9:
+                raise
+            print(f"[MONOVIDEOFIX] {built_exe.name} bloccato (antivirus?), nuovo tentativo tra 3 s...")
+            _time.sleep(3)
     print(f"[MONOVIDEOFIX] Completato! Dimensione finale: {built_exe.stat().st_size / (1024*1024):.2f} MB")

@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="96" height="96" alt="MonoVideoFix Logo">
 </p>
 
-<h1 align="center">MONOVIDEOFIX v1.10</h1>
+<h1 align="center">MONOVIDEOFIX v1.11</h1>
 <p align="center">
   <strong>Seedance FPS & Judder Repair Tool</strong><br>
   Strumento desktop con interfaccia grafica (PyQt5) e CLI per l'analisi automatica e la correzione chirurgica di scattini (<em>judder</em>), frame persi e frame duplicati nei video (es. conversioni errate 25 → 24 fps).
@@ -47,7 +47,8 @@ La mappa termica evidenzia quanto si muove ogni zona tra un frame e il successiv
   - Ogni video in coda ha la propria sensibilità; il pulsante **Applica a tutti** la estende all'intera coda e rianalizza i video che avevano un livello diverso. Il livello usato è riportato nel report.
 - **Supporto video a framerate variabile (VFR)**:
   - Legge solo i fotogrammi reali del file (ad es. 577 frame con timestamp alternati 50/33 ms, dichiarati a 60 fps ma a 24 fps reali) invece di duplicarli fino al framerate dichiarato.
-  - Il report segnala i **timestamp irregolari**, una causa di judder anche senza frame persi; l'export a FPS costanti riallinea ogni frame a intervalli identici.
+  - Il riquadro **TEMPI FRAME** e il report segnalano i **tempi irregolari** (es. `Da riallineare (33.3/50 ms)`): sono una causa di judder anche con 0 frame mancanti o duplicati, e nessuna sensibilità li trasforma in frame da sistemare. L'export a FPS costanti riallinea ogni frame a intervalli identici.
+  - Nell'**Anteprima Prima / Dopo** l'originale viene riprodotto con i **tempi reali** di ogni frame (es. 50 ms e 33 ms alternati) e il corretto a intervalli costanti (41.7 ms a 24 fps): lo scatto dovuto ai tempi si vede nel Prima e scompare nel Dopo. Sotto ogni riquadro è indicato per quanti ms il frame resta a schermo.
 - **Anteprima & Verifica Diagnostica Prima / Dopo (`👁 Anteprima & Verifica Correzione`)**:
   - **Confronto Side-by-Side sincronizzato** tra il video *Originale* e il video *Corretto (Optical Flow)*.
   - **Zoom & Pan Sincronizzati tra i Frame di Confronto**: usa la rotellina del mouse per zoomare fino a `8x` sul punto sotto il cursore, trascina per spostarti nell'inquadratura e fai doppio click per tornare al 100%; lo zoom e lo spostamento vengono replicati istantaneamente anche sul frame di confronto affiancato.
@@ -73,8 +74,8 @@ La mappa termica evidenzia quanto si muove ogni zona tra un frame e il successiv
 
 Non è necessario installare Python, OpenCV o FFmpeg:
 
-1. Scarica **`MONOVIDEOFIX_v1.10.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
-2. Avvia **`MONOVIDEOFIX_v1.10.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
+1. Scarica **`MONOVIDEOFIX_v1.11.exe`** dalla sezione [**Releases**](https://github.com/AronForti/monovideofix/releases/latest).
+2. Avvia **`MONOVIDEOFIX_v1.11.exe`** con un doppio clic (il singolo file `.exe` include già Python, PyQt5, OpenCV, `ffmpeg.exe` e `ffprobe.exe`).
 3. Trascina i video nella finestra: l'analisi partirà automaticamente.
 4. Clicca su **`👁 Anteprima & Verifica Correzione`** per ispezionare tramite le thumbnail dei momenti anomali, lo zoom sincronizzato, il rallentatore (`0.25x`) o la **Heat-Map Movimento** la risoluzione dei frame mancanti/duplicati.
 5. Scegli gli **FPS** e il **Codec** desiderati (applicati automaticamente a tutta la coda) e clicca su **ESPORTA**.
@@ -119,9 +120,9 @@ python fix_video_judder.py input_video.mp4 --keep-frame-count --bitrate 20M
 Per rigenerare l'eseguibile standalone a singolo file con PyInstaller (includendo automaticamente `ffmpeg.exe` e `ffprobe.exe` con estrazione on-demand):
 
 ```powershell
-pyinstaller --noconfirm --clean MONOVIDEOFIX_v1.10.spec
+pyinstaller --noconfirm --clean MONOVIDEOFIX_v1.11.spec
 ```
-Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.10.exe`.
+Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.11.exe`.
 
 ---
 
@@ -131,7 +132,7 @@ Il file compilato verrà generato in `dist\MONOVIDEOFIX_v1.10.exe`.
 | :--- | :--- |
 | `video_judder_gui.py` | Applicazione desktop GUI (PyQt5) con supporto Drag & Drop, Preview Prima/Dopo e coda Batch |
 | `fix_video_judder.py` | Script CLI per analisi ottica e riparazione judder da terminale |
-| `MONOVIDEOFIX_v1.10.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
+| `MONOVIDEOFIX_v1.11.spec` | Configurazione PyInstaller per la creazione del singolo file `.exe` con FFmpeg on-demand |
 | `requirements.txt` | Elenco delle dipendenze Python del progetto |
 | `LEGGIMI.txt` | Guida rapida per l'utente finale |
 | `monovideofix.ico` / `assets/icon.svg` | Icone dell'applicazione |
